@@ -1,0 +1,25 @@
+# Local toolchain and workspace-only material
+/tools/
+/分析/
+
+# Local Go caches and workspaces
+**/.gocache/
+**/.gopath/
+
+# Build output
+/dist/
+*.exe
+*.test
+*.out
+
+# Local secrets and data
+**/.env
+**/.env.*
+!**/.env.example
+**/data/
+
+# Editors and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

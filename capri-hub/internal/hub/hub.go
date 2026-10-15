@@ -1,0 +1,2140 @@
+// Package hub implements the capri-hub relay core: host pairing (pairing
+// code → token), the host registry, event fan-out to browsers, and the
+// browser ↔ host request relay.
+//
+// Transport model (WebSocket + HTTP API):
+//
+//	Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──WS /ws/host──▶ capri-host × N ──stdio──▶ grok
+//
+// Hosts connect OUTBOUND to the hub (NAT-friendly): one WebSocket carries
+// relayed browser requests down and host events / responds up. Browsers
+// open /ws/fe for the aggregated live event stream; REST APIs stay on HTTP.
+package hub
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	// PairingCodeTTL is how long a pairing code stays valid.
+	PairingCodeTTL = 15 * time.Minute
+	// pairingCodeCheckInterval is how often the maintainer looks for an
+	// expired pairing code to rotate.
+	pairingCodeCheckInterval = 30 * time.Second
+	// RelayTimeout caps how long the hub waits for a host to answer a
+	// relayed request (mirrors the host's 30-minute prompt timeout).
+	RelayTimeout = 45 * time.Minute
+	// eventBufCap bounds per-host buffered events for gap-pull. It MUST
+	// stay ≥ the host's replay ring (capri-host internal/hub replayCap =
+	// 1000): after a long disconnect the host replays up to its whole
+	// ring, and a smaller hub buffer would compact away the oldest of
+	// those events — the FE's gap-pull could then never fill the hole and
+	// its ordered-delivery buffer would wait on a predecessor that no
+	// longer exists on either side. 1500 keeps a margin above the host
+	// constant.
+	eventBufCap = 1500
+	// evBufHighWater is where RegisterEvent compacts the buffer back down
+	// to eventBufCap. Compacting on every overflow instead would copy the
+	// whole buffer per event (see RegisterEvent); the slack makes it
+	// amortized O(1) at the cost of at most 2× the buffer.
+	evBufHighWater = 2 * eventBufCap
+	// MaxHosts caps the registry so unbounded pair spam cannot grow
+	// memory / hub.json without limit.
+	MaxHosts = 256
+	// Max lengths for pair fields (reject, do not truncate).
+	maxHostIDLen   = 128
+	maxHostNameLen = 256
+)
+
+// EventBufGrace is how long after a host disconnect we keep its gap-pull
+// buffer so a short blip can still be filled via GET /api/events. Zero
+// clears immediately (tests may shrink this).
+var EventBufGrace = 60 * time.Second
+
+var (
+	// ErrCodeInvalid: the pairing code is wrong or expired.
+	ErrCodeInvalid = errors.New("配对码无效或已过期")
+	// ErrHostUnknown: hostId was never paired.
+	ErrHostUnknown = errors.New("host 未配对")
+	// ErrNoHost: nothing paired at all.
+	ErrNoHost = errors.New("没有已配对的 host")
+	// ErrHostLimit: registry is full (see MaxHosts).
+	ErrHostLimit = errors.New("已达 host 数量上限")
+)
+
+// FePrefs is the FE-side appearance preferences (e.g. scrollback toolcall
+// group folding). The hub stores and relays the map verbatim — it never
+// interprets keys/values, so the FE can extend it without a hub release.
+type FePrefs map[string]any
+
+// BrowserPrefs is the durable UI preferences for host conversations:
+// pinned workspaces (cwd paths), pinned sessions, per-session todo
+// status ('todo' / 'completed'; absence = no record) and FE-side
+// appearance prefs (fePrefs). The hub keeps ONE such document
+// (prefs.json) for all browsers; the FE mirrors it in localStorage
+// (offline cache) and writes it here (debounced) so pins/todos survive
+// browser data clearing. Records are keyed by sessionId/cwd only — session
+// ids are host-assigned UUIDs, so a doc is effectively per host
+// conversation without an explicit hostId scope.
+type BrowserPrefs struct {
+	// Entries is the source of truth: one last-write-wins record per
+	// preference item, deletions included (as tombstones). See prefs.go.
+	Entries PrefsEntries `json:"entries,omitempty"`
+	// The four fields below are a PROJECTION of Entries — what FEs render,
+	// and what pre-entries FEs and prefs.json files understand. The hub
+	// recomputes them from Entries on every write; a writer's own values are
+	// honored only when it sent no entries at all (a legacy client).
+	PinnedWorkspaces []string          `json:"pinnedWorkspaces"`
+	PinnedSessions   []string          `json:"pinnedSessions"`
+	Todos            map[string]string `json:"todos,omitempty"`
+	FePrefs          FePrefs           `json:"fePrefs,omitempty"`
+}
+
+// RelayError carries an HTTP status code for relay failures.
+type RelayError struct {
+	Status  int
+	Message string
+}
+
+func (e *RelayError) Error() string { return e.Message }
+
+// Event is a host event relayed to browsers; the hub tags it with the
+// host's hostId/hostName before fan-out.
+type Event map[string]any
+
+// HostInfo is the public registry entry (GET /api/hosts). busy/booting/
+// pendingCount are the host's live snapshot (host_status heartbeat) —
+// transient, never persisted; absent on older hosts/FEs that predate
+// them (omitempty). Port is the host's local HTTP listen port (so the
+// browser can probe 127.0.0.1:<port>); it is persisted.
+type HostInfo struct {
+	HostID   string `json:"hostId"`
+	HostName string `json:"hostName"`
+	Online   bool   `json:"online"`
+	Ready    bool   `json:"ready"`
+	// Busy: any session has a turn in flight (thinking / working).
+	Busy bool `json:"busy,omitempty"`
+	// Booting: agent process has not finished booting.
+	Booting bool `json:"booting,omitempty"`
+	// PendingCount: pending client requests (permits / x.ai questions).
+	PendingCount int `json:"pendingCount,omitempty"`
+	// Port: host's local HTTP listen port (e.g. 8765). FE probes
+	// http://127.0.0.1:<port> for a same-machine shortcut.
+	Port     int       `json:"port,omitempty"`
+	LastSeen time.Time `json:"lastSeen"`
+	Local    bool      `json:"local,omitempty"`
+}
+
+// RelayRequest is pushed to a host over its WebSocket.
+type RelayRequest struct {
+	V      int             `json:"v"`
+	Type   string          `json:"type"` // always "request"
+	ReqID  string          `json:"reqId"`
+	HostID string          `json:"hostId"` // 目标 host，host 端据此校验请求归属
+	Method string          `json:"method"`
+	Path   string          `json:"path"`
+	Body   json.RawMessage `json:"body,omitempty"`
+}
+
+// RelayResponse is the host's answer (WS type:"respond").
+type RelayResponse struct {
+	Status int             `json:"status"`
+	Body   json.RawMessage `json:"body,omitempty"`
+}
+
+// streamConn is one host's live WebSocket (hub ↔ host). The hub
+// writes relayed request / subscribers frames to it.
+type streamConn struct {
+	id    int64
+	write func(payload []byte) error
+}
+
+type pendingReq struct {
+	resp chan RelayResponse
+	done chan struct{}
+}
+
+type hostState struct {
+	info  HostInfo
+	token string
+	conn  *streamConn
+
+	// mu guards seq/evBuf ONLY (the per-host data plane). The global h.mu
+	// protects the registry (hosts/tokens maps, conn, info, pending) —
+	// event ingestion no longer serializes every host behind it. Lock
+	// order is always h.mu → hs.mu; nothing takes them the other way.
+	mu sync.Mutex
+
+	// seq is the last event sequence number seen from this host
+	// (host-assigned, monotonic per host process). evBuf is a bounded
+	// ring of recent events (with seq injected) so browsers can pull
+	// gaps: GET /api/events?host=X&after=SEQ.
+	seq   uint64
+	evBuf []Event
+	// evBufEpoch is bumped on disconnect (schedule clear) and reconnect
+	// (cancel clear). A delayed clear only runs if the epoch still matches.
+	evBufEpoch uint64
+
+	// fanout decouples uplink ingestion from browser fan-out. The host read
+	// loop only appends here (bounded, never blocks); a per-host goroutine
+	// drains it into h.broadcast. Without this the reader would run the
+	// per-subscriber fan-out itself — and a stalled reader stops draining the
+	// host socket, back-pressuring the host's entire uplink (events, responds,
+	// host_status) for every browser, not just the slow one.
+	//
+	// fanout is created (and its goroutine started) by fanoutOnce on the
+	// first enqueue, so hosts that never receive an event cost nothing.
+	fanout     chan Event
+	fanoutOnce sync.Once
+	// fanoutDropped counts events dropped because the fan-out queue was
+	// full. The event is already in evBuf, so a FE's (hostId,seq) gap-pull
+	// recovers it — this is not a loss, just deferred delivery.
+	fanoutDropped atomic.Uint64
+}
+
+// hostFanoutCap bounds the per-host pre-fan-out backlog. Overflow is
+// recoverable (see fanoutDropped): subscribers see a seq gap and pull the
+// event back out of evBuf.
+const hostFanoutCap = 2048
+
+// enqueueFanout hands one already-gated, already-buffered event to this
+// host's fan-out goroutine. Never blocks: a slow browser must not stall the
+// host read loop (see hostState.fanout).
+func (hs *hostState) enqueueFanout(h *Hub, ev Event) {
+	hs.fanoutOnce.Do(func() {
+		hs.fanout = make(chan Event, hostFanoutCap)
+		go func() {
+			for e := range hs.fanout {
+				h.broadcast(e)
+			}
+		}()
+	})
+	select {
+	case hs.fanout <- ev:
+	default:
+		hs.fanoutDropped.Add(1)
+	}
+}
+
+// Hub is the relay core. All methods are safe for concurrent use.
+type Hub struct {
+	mu sync.Mutex
+
+	pairingCode string
+	codeExpires time.Time
+
+	tokens map[string]string // token → hostId
+	hosts  map[string]*hostState
+
+	// subs is the browser-subscriber set as a copy-on-write slice behind
+	// an atomic pointer: fan-out reads the snapshot lock-free, and
+	// subscribe/unsubscribe swap in a new slice under h.mu. Churn is rare
+	// (browser connect/disconnect) while fan-out runs per event, so
+	// readers never contend on h.mu.
+	subs    atomic.Pointer[[]*feSubscriber]
+	pending map[string]map[string]*pendingReq
+
+	nextReq    atomic.Int64
+	nextConnID atomic.Int64
+	// subsGen stamps every subscriber-count frame so hosts can discard an
+	// out-of-order delivery (see notifyHostsSubscribers).
+	subsGen atomic.Uint64
+	// lastNotifiedSubs is the count each host was last told (hostID →
+	// count), used to skip no-op resends. Missing key = never notified.
+	lastNotifiedSubs map[string]int
+
+	dataFile string
+	// prefsFile holds the browser prefs document (prefs.json, sibling of
+	// hub.json). Written on SetPrefs only.
+	prefsFile string
+	prefs     BrowserPrefs
+	// prefsVersion is the CAS version of prefs: bumped on every accepted
+	// write, persisted in prefs.json, and echoed in GET/broadcast so FEs
+	// can make conditional (baseVersion) writes. 0 = never written.
+	prefsVersion uint64
+}
+
+// codeAlphabet avoids look-alike characters (no I/L/O/0/1).
+const codeAlphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+// New returns a Hub that persists pairing state under HUB_DATA_DIR when
+// set, else ~/.capri-hub.
+func New() *Hub {
+	return NewWithDir(defaultDataDir())
+}
+
+// NewWithDir returns a Hub persisting to dir/hub.json; pass "" to disable
+// persistence (used by tests).
+func NewWithDir(dir string) *Hub {
+	emptySubs := []*feSubscriber{}
+	h := &Hub{
+		tokens:  make(map[string]string),
+		hosts:   make(map[string]*hostState),
+		pending: make(map[string]map[string]*pendingReq),
+		prefs:   BrowserPrefs{PinnedWorkspaces: []string{}, PinnedSessions: []string{}, Todos: map[string]string{}},
+	}
+	h.subs.Store(&emptySubs)
+	if dir != "" {
+		h.dataFile = filepath.Join(dir, "hub.json")
+		h.load()
+		h.prefsFile = filepath.Join(dir, "prefs.json")
+		h.loadPrefs()
+	}
+	h.rotateCode()
+	return h
+}
+
+// defaultDataDir resolves where hub.json / prefs.json live.
+//
+// HUB_DATA_DIR wins when set: a container has no meaningful home
+// directory, and relying on $HOME to redirect state is fragile (it also
+// moves anything else that reads the home dir). An explicit override
+// lets the deployment mount one volume at one known path.
+func defaultDataDir() string {
+	if dir := strings.TrimSpace(os.Getenv("HUB_DATA_DIR")); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".capri-hub")
+}
+
+// ── persistence ───────────────────────────────────────────────────────
+
+type persistFile struct {
+	Tokens map[string]string      `json:"tokens"`
+	Hosts  map[string]persistHost `json:"hosts"`
+}
+
+type persistHost struct {
+	HostID   string `json:"hostId"`
+	HostName string `json:"hostName"`
+	Ready    bool   `json:"ready"`
+	Port     int    `json:"port,omitempty"`
+}
+
+func (h *Hub) load() {
+	b, err := os.ReadFile(h.dataFile)
+	if err != nil {
+		return
+	}
+	var pf persistFile
+	if json.Unmarshal(b, &pf) != nil {
+		return
+	}
+	for hid, ph := range pf.Hosts {
+		id := ph.HostID
+		if id == "" {
+			id = hid
+		}
+		h.hosts[id] = &hostState{
+			info: HostInfo{HostID: id, HostName: ph.HostName, Ready: ph.Ready, Port: ph.Port},
+		}
+	}
+	// Restore tokens and hostState.token so re-pair after restart can
+	// revoke the previous credential (delete by hs.token + by hostId).
+	for tok, hid := range pf.Tokens {
+		if tok == "" || hid == "" {
+			continue
+		}
+		h.tokens[tok] = hid
+		if hs := h.hosts[hid]; hs != nil {
+			// Last token wins as the "current" field; revokeTokensForHost
+			// still clears every map entry for the hostId.
+			hs.token = tok
+		} else {
+			// Orphan token without a hosts entry — synthesize a minimal host
+			// so the token remains usable and re-pair can still revoke it.
+			h.hosts[hid] = &hostState{
+				info:  HostInfo{HostID: hid},
+				token: tok,
+			}
+		}
+	}
+}
+
+// snapshotLocked returns a deep copy of the persistence snapshot; the
+// caller must hold h.mu. The copy is safe to marshal after releasing the
+// lock — never alias h.tokens / live host maps.
+func (h *Hub) snapshotLocked() persistFile {
+	pf := persistFile{
+		Tokens: make(map[string]string, len(h.tokens)),
+		Hosts:  make(map[string]persistHost, len(h.hosts)),
+	}
+	for tok, hid := range h.tokens {
+		pf.Tokens[tok] = hid
+	}
+	for hid, hs := range h.hosts {
+		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Ready: hs.info.Ready, Port: hs.info.Port}
+	}
+	return pf
+}
+
+// writePersist writes a snapshot to disk (unique temp + rename, mode 0600).
+// It never takes h.mu: slow or flaky disk must not stall the whole hub.
+// Concurrent callers each get their own temp file so they cannot clobber
+// one another's .tmp or race on rename.
+func (h *Hub) writePersist(pf persistFile) {
+	if h.dataFile == "" {
+		return
+	}
+	b, err := json.Marshal(pf)
+	if err != nil {
+		return
+	}
+	if err := writeFileAtomic(h.dataFile, b); err != nil {
+		log.Printf("[capri-hub] persist: %v", err)
+	}
+}
+
+// writeFileAtomic writes b to path via unique temp + rename (mode 0600).
+// Shared by hub.json (pairing state — secrets live here, never world
+// readable) and prefs.json. Same concurrency contract as writePersist:
+// never called while holding h.mu, and concurrent callers get their own
+// temp file so renames cannot race.
+func writeFileAtomic(path string, b []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	f, err := os.CreateTemp(dir, "hub-*.tmp")
+	if err != nil {
+		return fmt.Errorf("temp: %w", err)
+	}
+	tmpName := f.Name()
+	// Tokens live in hub.json — never world/group readable.
+	_ = f.Chmod(0o600)
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("write: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("close: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("rename: %w", err)
+	}
+	_ = os.Chmod(path, 0o600)
+	return nil
+}
+
+// ── browser preferences (pins / todos) ────────────────────────────────
+
+// loadPrefs reads prefs.json into h.prefs (+ version). A missing file
+// starts empty; an unreadable one is ignored (rebuilt on the next write).
+// The version rides in the same JSON object as a sibling key, so an older
+// hub reading a newer file still finds every doc field.
+func (h *Hub) loadPrefs() {
+	b, err := os.ReadFile(h.prefsFile)
+	if err != nil {
+		return
+	}
+	var raw prefsFileDoc
+	if json.Unmarshal(b, &raw) != nil {
+		log.Printf("[capri-hub] prefs: ignoring unreadable %s", h.prefsFile)
+		return
+	}
+	h.prefs = sanitizePrefs(raw.BrowserPrefs)
+	h.prefsVersion = raw.Version
+	// A prefs.json written before entries existed carries only the
+	// snapshot: materialize it so the merged state has a starting point.
+	// Stamped with the load time — any later real write (including a
+	// deletion) is newer and wins, and a stale offline client stamped at 0
+	// cannot overwrite it.
+	if len(h.prefs.Entries) == 0 {
+		h.prefs.Entries = entriesFromSnapshot(h.prefs, time.Now().UnixMilli())
+	}
+	prunePrefsTombstones(h.prefs.Entries, time.Now())
+}
+
+// prefsFileDoc is the prefs.json envelope: the doc fields at the top level
+// plus the CAS version (unknown-key-tolerant both ways across upgrades).
+type prefsFileDoc struct {
+	BrowserPrefs
+	Version uint64 `json:"version"`
+}
+
+// sanitizePrefs normalizes a decoded doc (nil slices/maps → empty
+// containers, entries without a writer identity dropped) so callers never
+// see nil containers or unorderable records.
+func sanitizePrefs(p BrowserPrefs) BrowserPrefs {
+	if p.PinnedWorkspaces == nil {
+		p.PinnedWorkspaces = []string{}
+	}
+	if p.PinnedSessions == nil {
+		p.PinnedSessions = []string{}
+	}
+	if p.Todos == nil {
+		p.Todos = map[string]string{}
+	}
+	if p.Entries == nil {
+		p.Entries = PrefsEntries{}
+	} else {
+		for k, e := range p.Entries {
+			if k == "" || e.Site == "" {
+				delete(p.Entries, k)
+			}
+		}
+	}
+	return p
+}
+
+// clonePrefs deep-copies a doc so stored state is never aliased by
+// callers mutating what they received.
+func clonePrefs(p BrowserPrefs) BrowserPrefs {
+	todos := make(map[string]string, len(p.Todos))
+	for k, v := range p.Todos {
+		todos[k] = v
+	}
+	fePrefs := make(FePrefs, len(p.FePrefs))
+	for k, v := range p.FePrefs {
+		fePrefs[k] = v
+	}
+	entries := make(PrefsEntries, len(p.Entries))
+	for k, v := range p.Entries {
+		entries[k] = v
+	}
+	return sanitizePrefs(BrowserPrefs{
+		Entries:          entries,
+		PinnedWorkspaces: append([]string(nil), p.PinnedWorkspaces...),
+		PinnedSessions:   append([]string(nil), p.PinnedSessions...),
+		Todos:            todos,
+		FePrefs:          fePrefs,
+	})
+}
+
+// ErrPrefsConflict: a conditional SetPrefs whose baseVersion no longer
+// matches the current version — the writer is stale and must re-pull.
+var ErrPrefsConflict = errors.New("prefs version conflict")
+
+// Prefs returns a deep copy of the browser prefs doc plus its current
+// version (a consistent pair under one lock; empty doc when the hub has
+// never received one).
+func (h *Hub) Prefs() (BrowserPrefs, uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return clonePrefs(h.prefs), h.prefsVersion
+}
+
+// SetPrefs folds a browser prefs write into the stored doc and persists it
+// to prefs.json.
+//
+// Two writer kinds, one stored truth:
+//
+//   - Entries-bearing (current FE): MERGED into the stored entries per key
+//     (newest (At, Site) record wins). The write is not conditional — a
+//     stale writer contributes nothing it hasn't actually touched, so
+//     base/hasBase are ignored and no version can be "too old". The stored
+//     snapshot is then recomputed from the merged entries, never taken from
+//     the request.
+//   - Snapshot-only (an FE from before entries existed): replaces the view
+//     as it always has (last write wins), bridged into entries so the two
+//     writer kinds share one state — pins/todos that vanished from the
+//     snapshot are tombstoned at the arrival time. Here base/hasBase still
+//     implement compare-and-swap, so two legacy clients cannot silently
+//     clobber each other's newer write.
+//
+// An accepted write bumps the version and is broadcast to browser
+// subscribers as `prefs_changed` (doc + version) so other browsers merge it
+// live. A write that changes nothing (a client re-pushing state the hub
+// already has) is dropped without bumping the version or broadcasting —
+// otherwise every reconnect would churn the doc.
+func (h *Hub) SetPrefs(prefs BrowserPrefs, base uint64, hasBase bool) (uint64, error) {
+	cp := clonePrefs(prefs) // clonePrefs already sanitizes
+	merged := len(cp.Entries) > 0
+	now := time.Now()
+	at := now.UnixMilli()
+
+	h.mu.Lock()
+	if hasBase && !merged {
+		if base != h.prefsVersion {
+			h.mu.Unlock()
+			return 0, ErrPrefsConflict
+		}
+	}
+	next := PrefsEntries{}
+	if merged {
+		mergePrefsEntries(next, h.prefs.Entries)
+		mergePrefsEntries(next, cp.Entries)
+	} else {
+		next = bridgeLegacyPrefs(h.prefs.Entries, cp, at)
+	}
+	prunePrefsTombstones(next, now)
+	if samePrefsEntries(h.prefs.Entries, next) {
+		// Nothing moved: keep the version, don't write, don't broadcast.
+		v := h.prefsVersion
+		h.mu.Unlock()
+		return v, nil
+	}
+	doc := cp
+	doc.Entries = next
+	applyPrefsProjection(&doc)
+	persist := h.prefsFile != ""
+	var payload []byte
+	if persist {
+		b, err := json.Marshal(prefsFileDoc{BrowserPrefs: doc, Version: h.prefsVersion + 1})
+		if err != nil {
+			h.mu.Unlock()
+			return 0, fmt.Errorf("marshal prefs: %w", err)
+		}
+		payload = b
+	}
+	h.prefsVersion++
+	newVersion := h.prefsVersion
+	h.prefs = doc
+	h.broadcast(prefsChanged(clonePrefs(doc), newVersion))
+	h.mu.Unlock()
+
+	if persist {
+		if err := writeFileAtomic(h.prefsFile, payload); err != nil {
+			log.Printf("[capri-hub] prefs persist: %v", err)
+		}
+	}
+	return newVersion, nil
+}
+
+// prefsChanged builds the prefs broadcast event (hub-level, no hostId —
+// browsers apply it regardless of the selected host). Carries the doc's
+// new version so clean clients track their CAS base without re-pulling.
+func prefsChanged(prefs BrowserPrefs, version uint64) Event {
+	return Event{"type": "prefs_changed", "params": map[string]any{"prefs": prefs, "version": version}}
+}
+
+// ── pairing ───────────────────────────────────────────────────────────
+
+// PairingCode returns the current pairing code and its expiry. If the
+// code has already expired it is rotated first so callers never see a
+// dead code advertised as current.
+func (h *Hub) PairingCode() (code string, expiresAt time.Time) {
+	return h.ensureFreshPairingCode()
+}
+
+func (h *Hub) rotateCode() {
+	h.pairingCode = randomString(codeAlphabet, 6)
+	h.codeExpires = time.Now().Add(PairingCodeTTL)
+}
+
+// ensureFreshPairingCode rotates when expired; returns the live code.
+func (h *Hub) ensureFreshPairingCode() (code string, expiresAt time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if time.Now().After(h.codeExpires) {
+		h.rotateCode()
+		log.Printf("[capri-hub] pairing code auto-rotated (expired): %s (expires %s)",
+			h.pairingCode, h.codeExpires.Format("15:04:05"))
+	}
+	return h.pairingCode, h.codeExpires
+}
+
+// RotatePairingCode replaces the pairing code (old one stops working).
+func (h *Hub) RotatePairingCode() (code string, expiresAt time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rotateCode()
+	log.Printf("[capri-hub] pairing code rotated: %s (expires %s)", h.pairingCode, h.codeExpires.Format("15:04:05"))
+	return h.pairingCode, h.codeExpires
+}
+
+// StartPairingCodeMaintainer periodically rotates expired pairing codes
+// until ctx is cancelled. Safe to call once per Hub.
+func (h *Hub) StartPairingCodeMaintainer(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(pairingCodeCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.ensureFreshPairingCode()
+			}
+		}
+	}()
+}
+
+// Pair exchanges a pairing code for a host token. Re-pairing an existing
+// hostId revokes every previous token for that host (not only hs.token),
+// so a restart that left multiple map entries cannot keep old credentials
+// alive. State is snapshotted under the lock but written to disk outside
+// it, so flaky storage never stalls the hub.
+//
+// Optional port (variadic): when the first extra arg is in 1..65535 it is
+// stored as HostInfo.Port (local HTTP listen port for FE localhost probe).
+// Omitted or out of range leaves any existing Port untouched on re-pair.
+func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
+	listenPort := 0
+	if len(port) > 0 {
+		listenPort = port[0]
+	}
+	h.mu.Lock()
+	// Constant-time compare: the pairing code is a short-lived secret and
+	// POST /api/pair is internet-reachable, so the comparison must not
+	// leak how many leading bytes matched. (subtle.ConstantTimeCompare
+	// still returns 0 immediately for differing lengths — the code length
+	// is fixed public knowledge, so that leak is harmless.)
+	if subtle.ConstantTimeCompare([]byte(strings.ToUpper(strings.TrimSpace(code))), []byte(h.pairingCode)) != 1 {
+		h.mu.Unlock()
+		return "", ErrCodeInvalid
+	}
+	if time.Now().After(h.codeExpires) {
+		h.mu.Unlock()
+		return "", ErrCodeInvalid
+	}
+	hostID = strings.TrimSpace(hostID)
+	hostName = strings.TrimSpace(hostName)
+	if hostID == "" {
+		h.mu.Unlock()
+		return "", errors.New("hostId 不能为空")
+	}
+	if len(hostID) > maxHostIDLen {
+		h.mu.Unlock()
+		return "", fmt.Errorf("hostId 过长（上限 %d）", maxHostIDLen)
+	}
+	if len(hostName) > maxHostNameLen {
+		h.mu.Unlock()
+		return "", fmt.Errorf("hostName 过长（上限 %d）", maxHostNameLen)
+	}
+	if hs, ok := h.hosts[hostID]; ok {
+		// Revoke every token for this hostId (covers multi-token legacy
+		// after a pre-fix restart load).
+		h.revokeTokensForHostLocked(hostID)
+		hs.info.HostName = hostName
+		hs.info.LastSeen = time.Now()
+		if listenPort > 0 && listenPort <= 65535 {
+			hs.info.Port = listenPort
+		}
+	} else {
+		if len(h.hosts) >= MaxHosts {
+			h.mu.Unlock()
+			return "", ErrHostLimit
+		}
+		info := HostInfo{HostID: hostID, HostName: hostName, LastSeen: time.Now()}
+		if listenPort > 0 && listenPort <= 65535 {
+			info.Port = listenPort
+		}
+		h.hosts[hostID] = &hostState{info: info}
+	}
+	token := randomToken()
+	h.tokens[token] = hostID
+	h.hosts[hostID].token = token
+	// Snapshot while holding the lock; write the file after releasing it.
+	var snap persistFile
+	persist := h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
+	h.mu.Unlock()
+
+	if persist {
+		h.writePersist(snap)
+	}
+	log.Printf("[capri-hub] host paired: %s (%s)", hostID, hostName)
+	return token, nil
+}
+
+// Unpair removes a host from the registry: revokes all its tokens, fails
+// in-flight relayed requests, drops its stream registration, and persists.
+// An active transport is left to close itself (auth is already revoked;
+// further events/dispatches for this hostId fail).
+func (h *Hub) Unpair(hostID string) error {
+	hostID = strings.TrimSpace(hostID)
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return ErrHostUnknown
+	}
+	h.revokeTokensForHostLocked(hostID)
+	h.failPendingLocked(hostID)
+	hs.conn = nil
+	delete(h.hosts, hostID)
+	delete(h.lastNotifiedSubs, hostID)
+	hs.mu.Lock()
+	hs.evBuf = nil
+	hs.mu.Unlock()
+	var snap persistFile
+	persist := h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
+	h.broadcast(hostsChanged())
+	h.mu.Unlock()
+
+	if persist {
+		h.writePersist(snap)
+	}
+	log.Printf("[capri-hub] host unpaired: %s", hostID)
+	return nil
+}
+
+// RenameHost updates a paired host's display name only — no token
+// revocation, no connection teardown (unlike re-pairing via /api/pair,
+// which would kick the host offline). Broadcasts hosts_changed so
+// browsers refresh the registry live.
+func (h *Hub) RenameHost(hostID, hostName string) error {
+	hostID = strings.TrimSpace(hostID)
+	hostName = strings.TrimSpace(hostName)
+	if hostID == "" {
+		return errors.New("hostId 不能为空")
+	}
+	if hostName == "" {
+		return errors.New("hostName 不能为空")
+	}
+	if len(hostName) > maxHostNameLen {
+		return fmt.Errorf("hostName 过长（上限 %d）", maxHostNameLen)
+	}
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return ErrHostUnknown
+	}
+	hs.info.HostName = hostName
+	var snap persistFile
+	persist := h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
+	h.broadcast(hostsChanged())
+	h.mu.Unlock()
+
+	if persist {
+		h.writePersist(snap)
+	}
+	log.Printf("[capri-hub] host renamed: %s → %s", hostID, hostName)
+	return nil
+}
+
+// revokeTokensForHostLocked removes every token → hostID mapping and
+// clears hostState.token. Caller must hold h.mu.
+func (h *Hub) revokeTokensForHostLocked(hostID string) {
+	for tok, hid := range h.tokens {
+		if hid == hostID {
+			delete(h.tokens, tok)
+		}
+	}
+	if hs := h.hosts[hostID]; hs != nil {
+		hs.token = ""
+	}
+}
+
+// HostIDForToken resolves a host token to its hostId.
+func (h *Hub) HostIDForToken(token string) (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hid, ok := h.tokens[token]
+	return hid, ok
+}
+
+// ── host connections ──────────────────────────────────────────────────
+
+// ConnectStream registers the host's outbound stream; the returned stop
+// func must be called when the connection ends (it fails all pending
+// relayed requests for that host when this conn is still current).
+//
+// If the host already has a live stream, the new connection supersedes
+// it: in-flight pending requests are failed immediately so they do not
+// hang until RelayTimeout (the old stop is a no-op once superseded).
+func (h *Hub) ConnectStream(hostID string, write func(payload []byte) error) (*streamConn, func(), error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		return nil, nil, ErrHostUnknown
+	}
+	// Supersede: fail requests that were written to the previous stream
+	// (or still waiting) — the old connection's stop will not clear them.
+	if hs.conn != nil {
+		h.failPendingLocked(hostID)
+	}
+	// Cancel any pending grace-period buffer clear from a prior disconnect.
+	hs.evBufEpoch++
+	conn := &streamConn{id: h.nextConnID.Add(1), write: write}
+	hs.conn = conn
+	hs.info.Online = true
+	hs.info.LastSeen = time.Now()
+	h.broadcast(hostsChanged())
+	return conn, func() { h.disconnectStream(hostID, conn) }, nil
+}
+
+func (h *Hub) disconnectStream(hostID string, conn *streamConn) {
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil || hs.conn != conn {
+		h.mu.Unlock()
+		return // superseded by a newer connection
+	}
+	hs.conn = nil
+	hs.info.Online = false
+	// Keep evBuf for EventBufGrace so short disconnects can still be
+	// gap-pulled; schedule a clear that no-ops if the host reconnects.
+	hs.evBufEpoch++
+	epoch := hs.evBufEpoch
+	h.failPendingLocked(hostID)
+	h.broadcast(hostsChanged())
+	grace := EventBufGrace
+	h.mu.Unlock()
+
+	if grace <= 0 {
+		h.mu.Lock()
+		hs := h.hosts[hostID]
+		if hs != nil && hs.conn == nil && hs.evBufEpoch == epoch {
+			hs.mu.Lock()
+			hs.evBuf = nil
+			hs.mu.Unlock()
+		}
+		h.mu.Unlock()
+		return
+	}
+	time.AfterFunc(grace, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		hs := h.hosts[hostID]
+		if hs == nil || hs.conn != nil || hs.evBufEpoch != epoch {
+			return
+		}
+		hs.mu.Lock()
+		hs.evBuf = nil
+		hs.mu.Unlock()
+	})
+}
+
+// IsCurrentConn reports whether connID is the host's live stream.
+// Transport loops check it before processing each uplink frame: after a
+// reconnect — or a duplicate host process pairing under the same hostId
+// — the superseded connection must not keep feeding the hub, or its
+// events would interleave with the new connection's seq space (both
+// count from 1) and the stale-seq gate would drop events from whichever
+// arrives later. The stale transport drops itself on its next frame.
+func (h *Hub) IsCurrentConn(hostID string, conn *streamConn) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	hs := h.hosts[hostID]
+	return hs != nil && hs.conn == conn
+}
+
+// failPendingLocked closes and drops every pending request for hostID.
+// Caller must hold h.mu.
+func (h *Hub) failPendingLocked(hostID string) {
+	for reqID, pr := range h.pending[hostID] {
+		close(pr.done)
+		delete(h.pending[hostID], reqID)
+	}
+	delete(h.pending, hostID)
+}
+
+// evSeq normalizes an event's seq across Go-native (uint64, direct
+// RegisterEvent callers) and JSON-decoded (float64, wire frames) values.
+func evSeq(ev Event) uint64 {
+	switch s := ev["seq"].(type) {
+	case float64:
+		if s > 0 {
+			return uint64(s)
+		}
+	case uint64:
+		return s
+	case int:
+		if s > 0 {
+			return uint64(s)
+		}
+	}
+	return 0
+}
+
+// EvSeq is the exported form of evSeq (used by cmd/capri-hub's frame-level
+// seqStart validation).
+func EvSeq(ev Event) uint64 { return evSeq(ev) }
+
+// HostStatusPatch carries the registry fields a host_status frame may
+// update. Fields absent from the frame arrive as nil and leave the
+// current value untouched (hosts predating busy/booting/pendingCount
+// send only `ready`). LastSeen refreshes on every frame; hosts_changed
+// fires when any field flips.
+type HostStatusPatch struct {
+	Ready        *bool
+	Busy         *bool
+	Booting      *bool
+	PendingCount *int
+	Port         *int
+}
+
+// UpdateHostStatus applies a control-plane host_status frame (no seq).
+// Always refreshes LastSeen; on any visible-field flip it updates the
+// registry entry and broadcasts hosts_changed. Returns false for unknown
+// hosts. Does not advance the per-host event seq or touch the transcript
+// buffer. Port flips are also persisted (FE may need the port after a
+// hub restart before the next heartbeat).
+func (h *Hub) UpdateHostStatus(hostID string, p HostStatusPatch) bool {
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return false
+	}
+	hs.info.LastSeen = time.Now()
+	changed := false
+	portChanged := false
+	if p.Ready != nil && *p.Ready != hs.info.Ready {
+		hs.info.Ready = *p.Ready
+		changed = true
+	}
+	if p.Busy != nil && *p.Busy != hs.info.Busy {
+		hs.info.Busy = *p.Busy
+		changed = true
+	}
+	if p.Booting != nil && *p.Booting != hs.info.Booting {
+		hs.info.Booting = *p.Booting
+		changed = true
+	}
+	if p.PendingCount != nil && *p.PendingCount != hs.info.PendingCount {
+		hs.info.PendingCount = *p.PendingCount
+		changed = true
+	}
+	if p.Port != nil {
+		port := *p.Port
+		if port > 0 && port <= 65535 && port != hs.info.Port {
+			hs.info.Port = port
+			changed = true
+			portChanged = true
+		}
+	}
+	var snap persistFile
+	persist := portChanged && h.dataFile != ""
+	if persist {
+		snap = h.snapshotLocked()
+	}
+	if changed {
+		h.broadcast(hostsChanged())
+	}
+	h.mu.Unlock()
+	if persist {
+		h.writePersist(snap)
+	}
+	return true
+}
+
+// SetHostReady updates only the Ready field — the host_status shape of
+// hosts predating busy/booting/pendingCount, and the events-frame
+// back-compat path (old hosts nest host_status inside events frames,
+// which carry readiness only anyway).
+func (h *Hub) SetHostReady(hostID string, ready bool) bool {
+	return h.UpdateHostStatus(hostID, HostStatusPatch{Ready: &ready})
+}
+
+// ResetHostSeq clears the per-host event counter and gap-pull buffer.
+// Used when a host process restarts: bridge seq restarts at 1 while the
+// hub still holds the previous process's LastSeq — without a reset, the
+// hub would skip fan-out for every new event with s <= old LastSeq.
+// Does not change Ready/Online or fire hosts_changed.
+func (h *Hub) ResetHostSeq(hostID string) bool {
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return false
+	}
+	hs.info.LastSeen = time.Now()
+	h.mu.Unlock()
+	hs.mu.Lock()
+	prev := hs.seq
+	hs.seq = 0
+	hs.evBuf = nil
+	hs.mu.Unlock()
+	if prev > 0 {
+		log.Printf("[capri-hub] host %s seq reset (was %d) — host process restart", hostID, prev)
+	}
+	return true
+}
+
+// RegisterEvent accepts a host event: tags it with the host's id/name,
+// assigns a sequence number (host-provided when present, else hub-side),
+// buffers it for gap-pull, updates liveness (and ready for host_status
+// events), then fans it out to browser subscribers. Returns false for
+// unknown hosts.
+//
+// When the host provides a seq s > 0 that is not strictly greater than
+// the already-seen max (s <= hs.seq), LastSeen is still refreshed but
+// the event is neither buffered nor broadcast — reconnect residual +
+// replay must not re-fan-out duplicates to the FE. The counter never
+// regresses.
+func (h *Hub) RegisterEvent(hostID string, ev Event) bool {
+	if ev == nil {
+		// A malformed frame (e.g. {"events":[null]}) must never panic the
+		// process — the QUIC path runs without net/http's recover.
+		return false
+	}
+	// Shallow-copy before tagging/buffering/broadcast: the caller's map
+	// must never gain injected keys, and the same map must not be shared
+	// between the replay buffer, every subscriber channel, and
+	// EventsAfter callers (one consumer mutating it would leak into all
+	// the others).
+	cp := make(Event, len(ev))
+	for k, v := range ev {
+		cp[k] = v
+	}
+	// Global lock only for the registry lookup + liveness; the seq /
+	// buffer update runs under the per-host lock and fan-out is
+	// lock-free, so one host's event ingest cannot serialize every other
+	// host behind h.mu (see hostState.mu).
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return false
+	}
+	hs.info.LastSeen = time.Now()
+	hostName := hs.info.HostName
+	h.mu.Unlock()
+
+	if fanout := hs.appendEvent(cp, hostID, hostName); fanout != nil {
+		// Back-compat: old hosts still send host_status inside events
+		// frames — flip Ready (and fire hosts_changed) via the same
+		// control-plane path WS host_status uses.
+		if t, _ := cp["type"].(string); t == "host_status" {
+			if r, ok := cp["ready"].(bool); ok {
+				h.SetHostReady(hostID, r)
+			}
+		}
+		hs.enqueueFanout(h, fanout)
+	}
+	return true
+}
+
+// appendEvent is RegisterEvent's per-host data-plane section: seq gating
+// (host-provided preserved, stale/duplicate skipped, hub-side assignment
+// otherwise), hostId/hostName tagging, gap-pull buffering and amortized
+// compaction. Returns the tagged event to fan out, or nil when the event
+// was stale/duplicate (accepted, LastSeen already refreshed — same
+// contract as before). Runs under hs.mu only.
+func (hs *hostState) appendEvent(cp Event, hostID, hostName string) Event {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	incoming := evSeq(cp)
+	assigned, ok := hs.gateSeqLocked(hostID, incoming)
+	if !ok {
+		return nil
+	}
+	if incoming == 0 {
+		cp["seq"] = assigned
+	}
+	cp["hostId"] = hostID
+	cp["hostName"] = hostName
+	hs.bufferEventLocked(cp)
+	return cp
+}
+
+// gateSeqLocked applies the per-host seq gate shared by the map and raw event
+// paths: a host-provided seq is preserved (stale/duplicate rejected), and a
+// host that sent no seq gets the next hub-side counter. Returns the seq the
+// caller should stamp on its event and ok=false when the event was stale/
+// duplicate (skip fan-out). The caller must hold hs.mu.
+func (hs *hostState) gateSeqLocked(hostID string, incoming uint64) (assigned uint64, ok bool) {
+	if incoming > 0 {
+		if incoming <= hs.seq {
+			if incoming < hs.seq {
+				Verbosef("[capri-hub] host %s event seq regressed: got %d, last %d (skip fan-out)", hostID, incoming, hs.seq)
+			}
+			return 0, false
+		}
+		hs.seq = incoming
+	} else {
+		hs.seq++
+	}
+	return hs.seq, true
+}
+
+// bufferEventLocked appends ev to the gap-pull ring and compacts at the
+// high-water mark. The copy (not a reslice) keeps dropped Event maps from
+// staying reachable via the old backing array. The caller must hold hs.mu.
+func (hs *hostState) bufferEventLocked(ev Event) {
+	hs.evBuf = append(hs.evBuf, ev)
+	if len(hs.evBuf) > evBufHighWater {
+		trimmed := make([]Event, eventBufCap, evBufHighWater)
+		copy(trimmed, hs.evBuf[len(hs.evBuf)-eventBufCap:])
+		hs.evBuf = trimmed
+	}
+}
+
+// ── raw (pre-encoded) event fast path ─────────────────────────────────
+//
+// Events arriving over the wire used to be fully decoded into Event maps
+// (one map + one allocation per leaf value per event — chunk storms burn
+// most of the hub's CPU there) and then re-encoded per FE on fan-out. The
+// raw path instead keeps the event body as json.RawMessage end-to-end:
+// only the fields the hub itself needs (seq/type/ready) are shallow
+// parsed, and the FE-bound wire bytes are produced once by splicing the
+// hub's hostId/hostName tags into the original bytes.
+//
+// rawWireKey is the reserved Event key under which the canonical wire
+// bytes travel through the fan-out channel and the gap-pull buffer. An
+// Event carrying it is opaque: consumers must serialize it via
+// MarshalEvent (which returns the bytes verbatim) instead of
+// json.Marshal. The key starts with NUL so it can never collide with a
+// wire field name. Alongside the raw bytes the map carries the few
+// shallow fields hub/FE code inspects: type, seq, hostId, hostName.
+const rawWireKey = "\x00wire"
+
+// MarshalEvent serializes one event to its canonical wire bytes: the
+// pre-encoded bytes verbatim for raw-path events, a plain marshal for
+// legacy map events.
+func MarshalEvent(ev Event) ([]byte, error) {
+	if raw, ok := ev[rawWireKey].(json.RawMessage); ok {
+		return raw, nil
+	}
+	return json.Marshal(ev)
+}
+
+// rawEventMeta is the shallow header the hub needs from every raw event.
+type rawEventMeta struct {
+	Seq   uint64 `json:"seq"`
+	Type  string `json:"type"`
+	Ready bool   `json:"ready"`
+	// Only tool_call_update has a payload member here; every other event
+	// type leaves it zero. Read for the drop-tier decision (criticalEvent) —
+	// the alternative is decoding the body per subscriber.
+	ToolCallUpdate struct {
+		Status string `json:"status"`
+	} `json:"toolCallUpdate"`
+}
+
+// spliceRawEvent builds the FE-bound wire bytes for one raw event by
+// appending the hub's tags before the closing brace of the original
+// object. Appending (rather than prepending) preserves the legacy
+// RegisterEvent semantics under duplicate keys — the hub's hostId /
+// hostName / injected seq always win (encoding/json keeps the LAST
+// occurrence). Returns nil when raw is not a JSON object (caller skips).
+func spliceRawEvent(raw, idJSON, nameJSON []byte, seq uint64, injectSeq bool) json.RawMessage {
+	r := bytes.TrimRight(raw, " \t\r\n")
+	if len(r) < 2 || r[0] != '{' || r[len(r)-1] != '}' {
+		return nil
+	}
+	out := make([]byte, 0, len(r)+len(idJSON)+len(nameJSON)+48)
+	out = append(out, r[:len(r)-1]...)
+	if len(out) > 1 { // non-empty object: separate from existing members
+		out = append(out, ',')
+	}
+	if injectSeq {
+		out = append(out, `"seq":`...)
+		out = strconv.AppendUint(out, seq, 10)
+		out = append(out, ',')
+	}
+	out = append(out, `"hostId":`...)
+	out = append(out, idJSON...)
+	out = append(out, `,"hostName":`...)
+	out = append(out, nameJSON...)
+	out = append(out, '}')
+	return json.RawMessage(out)
+}
+
+// RegisterRawEvents is RegisterEvent for events still in their original
+// wire form (host events frames): each body stays json.RawMessage, only
+// seq/type/ready are shallow-parsed, and the FE-bound bytes are spliced
+// once instead of decode-map + re-encode per subscriber. Semantics match
+// RegisterEvent exactly: seq gating / hub-side assignment, gap-pull
+// buffering, host_status ready flip, hostId/hostName tagging. Non-object
+// entries (e.g. null) are skipped. Returns false only for unknown hosts.
+func (h *Hub) RegisterRawEvents(hostID string, raws []json.RawMessage) bool {
+	// Same locking shape as RegisterEvent: global lock for lookup +
+	// liveness only; seq/buffer under the per-host lock; fan-out
+	// lock-free (see hostState.mu).
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return false
+	}
+	hs.info.LastSeen = time.Now()
+	hostName := hs.info.HostName
+	h.mu.Unlock()
+
+	idJSON, _ := json.Marshal(hostID)
+	nameJSON, _ := json.Marshal(hostName)
+	for _, raw := range raws {
+		// Validate shape BEFORE consuming a seq from the counter.
+		r := bytes.TrimRight(raw, " \t\r\n")
+		if len(r) < 2 || r[0] != '{' || r[len(r)-1] != '}' {
+			Verbosef("[capri-hub] host %s non-object event skipped", hostID)
+			continue
+		}
+		var meta rawEventMeta
+		if err := json.Unmarshal(r, &meta); err != nil {
+			continue
+		}
+		hs.mu.Lock()
+		// Same seq gating as appendEvent (shared via gateSeqLocked): preserve
+		// host seqs, skip stale/duplicate, fall back to hub-side assignment.
+		assigned, ok := hs.gateSeqLocked(hostID, meta.Seq)
+		if !ok {
+			hs.mu.Unlock()
+			continue
+		}
+		wire := spliceRawEvent(r, idJSON, nameJSON, assigned, meta.Seq == 0)
+		if wire == nil {
+			hs.mu.Unlock()
+			Verbosef("[capri-hub] host %s non-object event skipped", hostID)
+			continue
+		}
+		ev := Event{
+			rawWireKey: wire,
+			"type":     meta.Type,
+			"seq":      float64(assigned),
+			"hostId":   hostID,
+			"hostName": hostName,
+		}
+		switch meta.ToolCallUpdate.Status {
+		case "completed", "failed":
+			ev[terminalToolUpdateKey] = true
+		}
+		hs.bufferEventLocked(ev)
+		hs.mu.Unlock()
+		// Back-compat: old hosts still send host_status inside events
+		// frames (see RegisterEvent).
+		if meta.Type == "host_status" {
+			h.SetHostReady(hostID, meta.Ready)
+		}
+		hs.enqueueFanout(h, ev)
+	}
+	return true
+}
+
+// LastSeq returns the last event sequence number seen from hostID
+// (0 when unknown / nothing seen yet).
+func (h *Hub) LastSeq(hostID string) uint64 {
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	h.mu.Unlock()
+	if hs == nil {
+		return 0
+	}
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.seq
+}
+
+// SeqByHost returns the last event seq for every known host (for the FE
+// hello frame so browsers can detect what they missed while offline).
+func (h *Hub) SeqByHost() map[string]uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[string]uint64, len(h.hosts))
+	for id, hs := range h.hosts {
+		hs.mu.Lock()
+		out[id] = hs.seq
+		hs.mu.Unlock()
+	}
+	return out
+}
+
+// EventsAfter returns buffered events for hostID whose seq > after, in
+// ascending order. The returned slice shares storage with the hub buffer;
+// callers must not mutate the events.
+func (h *Hub) EventsAfter(hostID string, after uint64) []Event {
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	h.mu.Unlock()
+	if hs == nil {
+		return nil
+	}
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	// evBuf is append-only in strictly increasing seq order (RegisterEvent
+	// drops anything <= the watermark), so the cut point can be found by
+	// binary search instead of scanning up to evBufHighWater events on
+	// every reconnect gap-pull.
+	i := sort.Search(len(hs.evBuf), func(i int) bool {
+		return evSeq(hs.evBuf[i]) > after
+	})
+	if i >= len(hs.evBuf) {
+		return nil
+	}
+	out := make([]Event, len(hs.evBuf)-i)
+	copy(out, hs.evBuf[i:])
+	return out
+}
+
+// ── request relay ─────────────────────────────────────────────────────
+
+// Dispatch relays a browser request to a host and waits for its answer.
+// The host must have a live stream; otherwise a *RelayError is returned.
+//
+// ctx is the BROWSER's request context. When it is cancelled (tab closed,
+// navigation, mobile network drop) the wait is abandoned and the pending
+// slot freed immediately. Without that, an abandoned request pinned a
+// goroutine, a pending map entry and a 45-minute timer (RelayTimeout) for
+// the full timeout — a flaky client retrying prompts accumulates them until
+// the hub runs out of room. Cancelling the WAIT deliberately does NOT
+// cancel the host-side work: the prompt keeps running on the agent (that is
+// the point of the server-authoritative design) and its output still
+// reaches browsers over the event stream.
+func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body json.RawMessage) (RelayResponse, error) {
+	reqID := fmt.Sprintf("%d", h.nextReq.Add(1))
+
+	h.mu.Lock()
+	hs := h.hosts[hostID]
+	if hs == nil {
+		h.mu.Unlock()
+		return RelayResponse{}, &RelayError{Status: 404, Message: ErrHostUnknown.Error()}
+	}
+	conn := hs.conn
+	if conn == nil {
+		h.mu.Unlock()
+		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 当前离线", hostID)}
+	}
+	pr := &pendingReq{resp: make(chan RelayResponse, 1), done: make(chan struct{})}
+	if h.pending[hostID] == nil {
+		h.pending[hostID] = make(map[string]*pendingReq)
+	}
+	h.pending[hostID][reqID] = pr
+	h.mu.Unlock()
+
+	payload, err := json.Marshal(RelayRequest{V: 1, Type: "request", ReqID: reqID, HostID: hostID, Method: method, Path: path, Body: body})
+	if err != nil {
+		h.dropPending(hostID, reqID)
+		return RelayResponse{}, &RelayError{Status: 500, Message: err.Error()}
+	}
+	if err := conn.write(payload); err != nil {
+		h.dropPending(hostID, reqID)
+		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
+	}
+
+	timer := time.NewTimer(RelayTimeout)
+	defer timer.Stop()
+	// A response that already arrived must win over a concurrently
+	// firing timeout: select would otherwise pick the timer branch at
+	// random and drop an answer that is already here.
+	select {
+	case resp := <-pr.resp:
+		return resp, nil
+	default:
+	}
+	select {
+	case resp := <-pr.resp:
+		return resp, nil
+	case <-pr.done:
+		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 已断开", hostID)}
+	case <-ctx.Done():
+		// Browser gone: stop waiting and release the pending slot. The host
+		// keeps executing; its late respond simply finds no pending entry.
+		h.dropPending(hostID, reqID)
+		return RelayResponse{}, &RelayError{Status: 499, Message: "客户端已取消"}
+	case <-timer.C:
+		h.dropPending(hostID, reqID)
+		return RelayResponse{}, &RelayError{Status: 504, Message: "中继超时"}
+	}
+}
+
+func (h *Hub) dropPending(hostID, reqID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if m := h.pending[hostID]; m != nil {
+		delete(m, reqID)
+		if len(m) == 0 {
+			delete(h.pending, hostID)
+		}
+	}
+}
+
+// Respond resolves a relayed request with the host's answer.
+func (h *Hub) Respond(hostID, reqID string, resp RelayResponse) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	m := h.pending[hostID]
+	if m == nil {
+		return false
+	}
+	pr, ok := m[reqID]
+	if !ok {
+		return false
+	}
+	delete(m, reqID)
+	if len(m) == 0 {
+		delete(h.pending, hostID)
+	}
+	if hs := h.hosts[hostID]; hs != nil {
+		hs.info.LastSeen = time.Now()
+	}
+	pr.resp <- resp
+	return true
+}
+
+// ── registry / browsers ───────────────────────────────────────────────
+
+// ListHosts returns the registry, online hosts first, most recently seen
+// first.
+func (h *Hub) ListHosts() []HostInfo {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]HostInfo, 0, len(h.hosts))
+	for _, hs := range h.hosts {
+		out = append(out, hs.info)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Online != out[j].Online {
+			return out[i].Online
+		}
+		if !out[i].LastSeen.Equal(out[j].LastSeen) {
+			return out[i].LastSeen.After(out[j].LastSeen)
+		}
+		return out[i].HostID < out[j].HostID
+	})
+	return out
+}
+
+// DefaultHostID picks the host for requests that don't name one: the most
+// recently seen online host, else the most recently seen one overall.
+func (h *Hub) DefaultHostID() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var best string
+	for _, hs := range h.hosts {
+		if hs.info.Online {
+			if best == "" || hs.info.LastSeen.After(h.hosts[best].info.LastSeen) {
+				best = hs.info.HostID
+			}
+		}
+	}
+	if best != "" {
+		return best
+	}
+	for _, hs := range h.hosts {
+		if best == "" || hs.info.LastSeen.After(h.hosts[best].info.LastSeen) {
+			best = hs.info.HostID
+		}
+	}
+	return best
+}
+
+// Subscribe returns a buffered channel of relayed events; call the
+// returned func to unsubscribe.
+//
+// Subscribe/unsubscribe notify connected hosts of the browser subscriber
+// count so they can pause event upload when nobody is listening (heartbeat
+// host_status still runs on the host side).
+func (h *Hub) Subscribe() (ch chan Event, unsubscribe func()) {
+	ch, unsub, _ := h.TrySubscribe(0) // 0 = unlimited
+	return ch, unsub
+}
+
+// feSubscriber is one browser /ws/fe registration. The channel is the
+// fan-out queue; per-subscriber pressure state hangs off this struct so
+// the copy-on-write list stays a plain slice.
+//
+// Delivery model: deliver() only appends to the per-subscriber ring (never
+// blocks), and this subscriber's own pump goroutine owns every write to ch.
+// A wedged browser therefore stalls nothing but its own pump — not the
+// host read loop that feeds fan-out, and not the other browsers watching
+// the same host (before the ring, a wedged subscriber's full channel was
+// waited on inline, on the shared fan-out path).
+type feSubscriber struct {
+	ch chan Event
+
+	// host is this subscriber's event filter: a host ID fans out only
+	// that host's events, the empty string (or nothing stored) fans out
+	// every host — the behaviour pre-filtering FE clients get. Written by
+	// the /ws/fe reader when the page switches hosts and read lock-free
+	// per event by broadcast, hence the atomic.
+	host atomic.Value // string
+
+	// dropped counts events dropped (or dropped-eligible) for this slow
+	// subscriber. Once it reaches resyncDropThreshold a resync frame is
+	// pushed and the counter resets — one resync per threshold worth of
+	// drops, so a permanently stuck FE cannot trigger a resync storm.
+	dropped atomic.Int32
+
+	mu       sync.Mutex
+	ring     []Event
+	head     int
+	n        int
+	pending  *Event // one queued resync frame, delivered ahead of the ring
+	wake     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+const (
+	// subRingCap bounds a subscriber's droppable backlog in front of its
+	// channel. Overflow drops (recoverable: the FE gap-pulls the seq hole).
+	subRingCap = 2048
+	// subRingCriticalSlack reserves ring room for critical events so a
+	// droppable flood can never displace a terminal state.
+	subRingCriticalSlack = 512
+)
+
+// newFeSubscriber registers the ring/pump for one browser subscriber.
+// chCap is the consumer-facing buffer (the /ws/fe writer's queue).
+func newFeSubscriber(chCap int) *feSubscriber {
+	s := &feSubscriber{
+		ch:   make(chan Event, chCap),
+		ring: make([]Event, subRingCap+subRingCriticalSlack),
+		wake: make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	go s.pump()
+	return s
+}
+
+// stop ends this subscriber's pump (unsubscribe path).
+func (s *feSubscriber) stop() {
+	s.stopOnce.Do(func() { close(s.done) })
+}
+
+// enqueue appends ev to the ring. Droppable events drop once the droppable
+// ceiling is reached; critical events may use the reserved slack. Never
+// blocks — the caller is the fan-out path.
+func (s *feSubscriber) enqueue(ev Event, critical bool) {
+	limit := subRingCap
+	if critical {
+		limit = len(s.ring)
+	}
+	s.mu.Lock()
+	if s.n >= limit {
+		s.mu.Unlock()
+		s.noteDrop(ev, critical)
+		return
+	}
+	s.ring[(s.head+s.n)%len(s.ring)] = ev
+	s.n++
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// pump delivers this subscriber's ring in order. Droppable events are
+// dropped the moment ch is full (transient jitter the FE repairs);
+// critical events — and a queued resync, which is flushed ahead of the ring —
+// wait for a free slot instead, so a terminal state is never lost while the
+// subscriber is live.
+func (s *feSubscriber) pump() {
+	for {
+		s.mu.Lock()
+		if s.pending != nil {
+			ev := *s.pending
+			s.pending = nil
+			s.mu.Unlock()
+			if !s.send(ev) {
+				return
+			}
+			continue
+		}
+		if s.n == 0 {
+			s.mu.Unlock()
+			select {
+			case <-s.wake:
+				continue
+			case <-s.done:
+				return
+			}
+		}
+		ev := s.ring[s.head]
+		s.mu.Unlock()
+
+		if criticalEvent(ev) {
+			if !s.send(ev) {
+				return
+			}
+		} else if !s.trySend(ev) {
+			if s.stopped() {
+				return
+			}
+			s.noteDrop(ev, false)
+		}
+
+		s.mu.Lock()
+		s.ring[s.head] = nil
+		s.head = (s.head + 1) % len(s.ring)
+		s.n--
+		s.mu.Unlock()
+	}
+}
+
+// send blocks until ev is handed to the consumer or the subscriber stops.
+func (s *feSubscriber) send(ev Event) bool {
+	select {
+	case s.ch <- ev:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
+// trySend is send without waiting.
+func (s *feSubscriber) trySend(ev Event) bool {
+	select {
+	case s.ch <- ev:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *feSubscriber) stopped() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// noteDrop records one event lost to this subscriber and decides whether to
+// escalate to a resync frame.
+//
+// A dropped CRITICAL event escalates immediately instead of waiting for the
+// threshold: the FE would otherwise sit on a turn that already ended (or a
+// permission card that will never paint) with no later event to reveal the
+// gap — the (hostId,seq) gap-pull only fires when a higher seq arrives, and
+// a terminal event is usually the last one of its turn.
+//
+// The frame is QUEUED in a dedicated slot, not pushed: noteDrop runs on the
+// fan-out path, where blocking is forbidden (a full channel must never stall
+// the host read loop), and a push would be lost exactly when the consumer is
+// behind — the moment the resync matters. The pump flushes it ahead of the
+// ring backlog as soon as the consumer drains.
+func (s *feSubscriber) noteDrop(ev Event, critical bool) {
+	n := s.dropped.Add(1)
+	if !critical && n < resyncDropThreshold {
+		return
+	}
+	s.dropped.Store(0)
+	s.queueResync(resyncFrame(ev))
+}
+
+// queueResync parks one control frame for the pump. It never blocks and never
+// competes with the ring for room; a newer resync replaces a still-pending
+// one (both mean "rebuild", and the FE only ever advances its watermark, so
+// keeping the newest boundary is the safe choice).
+func (s *feSubscriber) queueResync(ev Event) {
+	s.mu.Lock()
+	s.pending = &ev
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// hostFilter is the subscriber's current host filter ("" = every host).
+func (s *feSubscriber) hostFilter() string {
+	if v, ok := s.host.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// watches reports whether an event tagged evHost reaches this subscriber.
+// Hub-level events (no hostId — hosts_changed, prefs_changed, the FE
+// hello) always pass: every browser needs the registry whichever host it
+// displays.
+func (s *feSubscriber) watches(evHost string) bool {
+	if evHost == "" {
+		return true
+	}
+	f := s.hostFilter()
+	return f == "" || f == evHost
+}
+
+// Drop-tier policy for a full subscriber queue. Terminal / control events
+// must never be lost to backpressure: a FE that misses "done" or a
+// client_request waits on a turn that already ended. Bulk streaming
+// events (chunk/thought and everything else) are droppable — the FE's
+// (hostId,seq) gap-pull repairs them.
+//
+// The set MUST cover every event the FE treats as a turn terminal or a
+// pending-interaction transition (see capri-fe store/chat/turnLifecycle.ts
+// TURN_TERMINAL_TYPES + events/turnEnd.ts): dropping "cancelled" /
+// "prompt_complete" leaves the composer stuck on "Responding…" with no
+// later event to reveal the gap, and a dropped session-scoped "error"
+// hides the failure entirely.
+var criticalEventTypes = map[string]struct{}{
+	"done":                    {},
+	"turn_completed":          {},
+	"cancelled":               {},
+	"prompt_complete":         {},
+	"error":                   {},
+	"client_request":          {},
+	"client_request_resolved": {},
+}
+
+// terminalToolUpdateKey flags the raw-path Event of a tool call's terminal
+// update. Host events reach the hub as opaque bytes (see rawWireKey), so
+// criticalEvent cannot see the nested status unless ingest lifts it. The
+// NUL-prefixed key follows the rawWireKey convention: an Event carrying it
+// also carries rawWireKey, and MarshalEvent returns those bytes verbatim,
+// so the flag can never leak onto the FE wire.
+const terminalToolUpdateKey = "\x00terminalToolUpdate"
+
+const (
+	// resyncDropThreshold is the dropped-event count that triggers one
+	// {"type":"resync",fromSeq:N} frame (counter then resets). A dropped
+	// critical event escalates immediately instead of waiting for it.
+	resyncDropThreshold = 32
+)
+
+// criticalEvent reports whether ev is a never-drop event type. A
+// tool_call_update counts only when it carries the call's terminal status:
+// losing that one update leaves the FE spinning a "Running" block until the
+// turn-end settle, while the in_progress argument/output deltas for the same
+// call stay droppable (gap-pull refills them).
+func criticalEvent(ev Event) bool {
+	if ev[terminalToolUpdateKey] == true {
+		return true
+	}
+	t, _ := ev["type"].(string)
+	if _, ok := criticalEventTypes[t]; ok {
+		return true
+	}
+	if t != "tool_call_update" {
+		return false
+	}
+	// Legacy decoded path (RegisterEvent): the payload is already a map.
+	u, ok := ev["toolCallUpdate"].(map[string]any)
+	if !ok {
+		return false
+	}
+	s, _ := u["status"].(string)
+	return s == "completed" || s == "failed"
+}
+
+// deliver is one subscriber's fan-out step: a non-blocking append to this
+// subscriber's ring, drained in order by its pump. It must never block —
+// deliver runs on the host fan-out path, and waiting inline on a wedged
+// browser's full channel used to slow every other browser watching that host
+// (and, before the per-host queue, the host read loop itself). Drop
+// accounting and resync escalation live in noteDrop.
+func (s *feSubscriber) deliver(ev Event) {
+	s.enqueue(ev, criticalEvent(ev))
+}
+
+// resyncFrame builds the slow-consumer recovery frame for one dropped
+// event. Event seq counters are PER HOST, so the frame has to name the host
+// that tripped it: an untagged resync from host B's drop storm was applied
+// to whichever host the page happened to watch, jumping that host's
+// watermark to B's sequence and silently dropping every event below it.
+// Hub-level events carry no hostId and stay untagged.
+func resyncFrame(ev Event) Event {
+	out := Event{"type": "resync", "fromSeq": evSeq(ev)}
+	if hostID, _ := ev["hostId"].(string); hostID != "" {
+		out["hostId"] = hostID
+	}
+	return out
+}
+
+// subscribeLocked registers s in the copy-on-write subscriber list. The
+// caller must hold h.mu; readers (broadcast) see the old or new slice,
+// never a torn one.
+func (h *Hub) subscribeLocked(s *feSubscriber) {
+	var next []*feSubscriber
+	if cur := h.subs.Load(); cur != nil {
+		next = make([]*feSubscriber, 0, len(*cur)+1)
+		next = append(next, *cur...)
+	} else {
+		next = make([]*feSubscriber, 0, 1)
+	}
+	next = append(next, s)
+	h.subs.Store(&next)
+}
+
+// unsubscribe removes s (copy-on-write, under h.mu).
+func (h *Hub) unsubscribe(s *feSubscriber) {
+	var cur []*feSubscriber
+	if p := h.subs.Load(); p != nil {
+		cur = *p
+	}
+	next := make([]*feSubscriber, 0, len(cur))
+	for _, sub := range cur {
+		if sub != s {
+			next = append(next, sub)
+		}
+	}
+	h.subs.Store(&next)
+}
+
+// TrySubscribe is Subscribe with no host filter. TrySubscribeHost adds one.
+func (h *Hub) TrySubscribe(max int) (ch chan Event, unsubscribe func(), ok bool) {
+	return h.TrySubscribeHost(max, "")
+}
+
+// TrySubscribeHost is Subscribe with a subscriber cap and an initial host
+// filter ("" = every host): when max > 0 and the hub already has max live
+// browser subscribers, it returns ok=false instead of registering another.
+// Each subscriber costs a 512-event channel plus the caller's goroutines,
+// so the /ws/fe endpoint uses this as a resource guard when it is open to
+// unauthenticated clients.
+func (h *Hub) TrySubscribeHost(max int, hostID string) (ch chan Event, unsubscribe func(), ok bool) {
+	// 512 absorbs short FE write stalls; the subscriber's own pump (see
+	// feSubscriber) makes the fan-out path never wait on it.
+	s := newFeSubscriber(512)
+	if hostID != "" {
+		s.host.Store(hostID)
+	}
+	h.mu.Lock()
+	if cur := h.subs.Load(); cur != nil && max > 0 && len(*cur) >= max {
+		h.mu.Unlock()
+		s.stop()
+		return nil, nil, false
+	}
+	h.subscribeLocked(s)
+	h.mu.Unlock()
+	h.notifyHostsSubscribers()
+	return s.ch, func() {
+		h.mu.Lock()
+		h.unsubscribe(s)
+		h.mu.Unlock()
+		s.stop()
+		for {
+			select {
+			case <-s.ch:
+			default:
+				goto drained
+			}
+		}
+	drained:
+		h.notifyHostsSubscribers()
+	}, true
+}
+
+// SetSubscriberHost retargets a live subscriber's host filter, identifying
+// the subscriber by the channel TrySubscribe handed back — channel values
+// are comparable and every subscriber owns a distinct one, so no extra
+// handle type is needed on the hot path. hostID "" restores the
+// watch-every-host default.
+//
+// The change is a fan-out change for TWO hosts (the one the page left and
+// the one it joined), so it re-notifies hosts: the abandoned host drops to
+// zero viewers and pauses its event upload, the new one wakes up. Returns
+// false when ch is not (or no longer) a live subscriber.
+func (h *Hub) SetSubscriberHost(ch chan Event, hostID string) bool {
+	h.mu.Lock()
+	var found bool
+	if cur := h.subs.Load(); cur != nil {
+		for _, s := range *cur {
+			if s.ch == ch {
+				s.host.Store(hostID)
+				found = true
+				break
+			}
+		}
+	}
+	h.mu.Unlock()
+	if !found {
+		return false
+	}
+	h.notifyHostsSubscribers()
+	return true
+}
+
+// SubscriberCount is the number of live browser /ws/fe clients, whatever
+// host each of them watches.
+func (h *Hub) SubscriberCount() int {
+	if cur := h.subs.Load(); cur != nil {
+		return len(*cur)
+	}
+	return 0
+}
+
+// SubscriberCountFor is the number of live browser subscribers that
+// actually RECEIVE hostID's events: those filtered to hostID plus every
+// watch-all subscriber. Hosts gate event upload on this figure — a page
+// showing host A is not an audience for host B, so B can pause its uplink
+// instead of streaming into a fan-out that drops it. hostID "" is the
+// watch-all audience, i.e. every subscriber.
+func (h *Hub) SubscriberCountFor(hostID string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.subscriberCountForLocked(hostID)
+}
+
+// subscriberCountForLocked runs the per-subscriber filter test. Callers
+// hold h.mu.
+func (h *Hub) subscriberCountForLocked(hostID string) int {
+	var n int
+	if cur := h.subs.Load(); cur != nil {
+		for _, s := range *cur {
+			if s.watches(hostID) {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// notifyHostsSubscribers pushes {v:1, type:"subscribers", count:N, gen:G}
+// to every online host WebSocket. Hosts use count==0 to stop uploading
+// bridge events (they still send host_status heartbeats). Writes run
+// outside h.mu so a slow host cannot stall the hub lock.
+//
+// N is PER HOST — the number of subscribers that actually receive that
+// host's events (see SubscriberCountFor), not the raw browser count. With
+// the /ws/fe host filter in place this is what lets an unwatched host stop
+// uploading at all.
+//
+// `gen` is a hub-monotonic generation stamp and it is load-bearing: the
+// frames are ABSOLUTE state, they are written from one fire-and-forget
+// goroutine per host, and a slow write can therefore deliver them OUT OF
+// ORDER. Without the stamp a browser refresh (unsubscribe → count 0,
+// resubscribe → count 1, microseconds apart) can land as 1 then 0, leaving
+// the host convinced nobody is watching: it stops uploading bridge events
+// while host_status heartbeats keep it "online", so the freshly reloaded
+// page shows a live-looking but permanently frozen session. Hosts keep the
+// highest gen seen and ignore anything older.
+//
+// A count that has not changed since the last notification for THAT host
+// is not resent (browser churn on a multi-tab hub is otherwise a per-host
+// write storm); a lost frame is repaired by the periodic re-assert on the
+// host ping.
+func (h *Hub) notifyHostsSubscribers() {
+	h.mu.Lock()
+	type pending struct {
+		write func([]byte) error
+		host  string
+		count int
+	}
+	var todo []pending
+	for id, hs := range h.hosts {
+		if hs.conn == nil {
+			continue
+		}
+		count := h.subscriberCountForLocked(id)
+		if prev, seen := h.lastNotifiedSubs[id]; seen && prev == count {
+			continue
+		}
+		if h.lastNotifiedSubs == nil {
+			h.lastNotifiedSubs = make(map[string]int)
+		}
+		h.lastNotifiedSubs[id] = count
+		todo = append(todo, pending{write: hs.conn.write, host: id, count: count})
+	}
+	if len(todo) == 0 {
+		h.mu.Unlock()
+		return
+	}
+	gen := h.subsGen.Add(1)
+	writes := make([]func([]byte) error, 0, len(todo))
+	frames := make([][]byte, 0, len(todo))
+	for _, p := range todo {
+		b, err := json.Marshal(map[string]any{
+			"v": 1, "type": "subscribers", "count": p.count, "gen": gen,
+		})
+		if err != nil {
+			continue
+		}
+		frames = append(frames, b)
+		writes = append(writes, p.write)
+	}
+	h.mu.Unlock()
+	if len(frames) == 0 {
+		return
+	}
+	// Fire-and-forget per host: writes carry a multi-second timeout each,
+	// so one half-open host must not stall the caller (subscribe /
+	// unsubscribe). Ordering across goroutines is handled by `gen`.
+	for i, write := range writes {
+		go func(w func([]byte) error, payload []byte) {
+			_ = w(payload)
+		}(write, frames[i])
+	}
+}
+
+// SubscribersState returns the total live browser subscriber count together
+// with a fresh monotonic generation stamp — the watch-all audience, i.e.
+// what every host used to be told before per-host filtering.
+func (h *Hub) SubscribersState() (count int, gen uint64) {
+	return h.subscribersStateFor("")
+}
+
+// SubscribersStateFor is SubscribersState scoped to the subscribers that
+// receive hostID's events, for transports that re-assert the count on their
+// periodic host ping. Re-asserting makes the subscriber count self-healing:
+// a `subscribers` frame lost to a write error or a superseded connection is
+// corrected within one ping interval instead of leaving the host paused
+// until the next browser connect/disconnect.
+func (h *Hub) SubscribersStateFor(hostID string) (count int, gen uint64) {
+	return h.subscribersStateFor(hostID)
+}
+
+func (h *Hub) subscribersStateFor(hostID string) (count int, gen uint64) {
+	h.mu.Lock()
+	count = h.subscriberCountForLocked(hostID)
+	h.mu.Unlock()
+	return count, h.subsGen.Add(1)
+}
+
+// Broadcast fans an event out to browser subscribers (drops for slow
+// consumers). Callers typically use RegisterEvent instead.
+func (h *Hub) Broadcast(ev Event) {
+	h.broadcast(ev)
+}
+
+// broadcast fans an event out to the browser subscribers that watch its
+// host, against a lock-free copy-on-write snapshot of the subscriber list:
+// registration churn (browser connect/disconnect, host switch) swaps the
+// slice under h.mu, while this hot path — per host event — never touches
+// the global lock.
+func (h *Hub) broadcast(ev Event) {
+	cur := h.subs.Load()
+	if cur == nil {
+		return
+	}
+	// hostId is stamped on the Event map by both ingest paths
+	// (appendEvent / RegisterRawEvents), so the filter is a map read, not
+	// a decode. Hub-level events carry no hostId and reach everyone.
+	evHost, _ := ev["hostId"].(string)
+	for _, s := range *cur {
+		if !s.watches(evHost) {
+			continue
+		}
+		s.deliver(ev)
+	}
+}
+
+func hostsChanged() Event {
+	return Event{"type": "hosts_changed", "params": map[string]any{}}
+}
+
+// ── helpers ───────────────────────────────────────────────────────────
+
+func randomString(alphabet string, n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// Never block pairing on a broken RNG.
+		now := time.Now().UnixNano()
+		for i := range b {
+			now = now*6364136223846793005 + 1442695040888963407
+			b[i] = alphabet[int(now>>33)%len(alphabet)]
+		}
+		return string(b)
+	}
+	for i := range b {
+		b[i] = alphabet[int(b[i])%len(alphabet)]
+	}
+	return string(b)
+}
+
+func randomToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}

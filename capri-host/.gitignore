@@ -1,0 +1,27 @@
+# Playwright CLI artifacts
+.playwright-cli/
+
+# Binaries
+/capri-host
+/bin/
+/dist/
+/release/
+*.exe
+*.exe~
+*.syso
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+internal/server/web

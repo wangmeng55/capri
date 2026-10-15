@@ -1,0 +1,28 @@
+# Binaries (never commit built hub)
+/capri-hub
+acp-hub
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+/bin/
+
+# Docker deployment (docker-compose.yml mounts ./data)
+# .env holds FE_TOKEN; data/ holds every paired host's token.
+.env
+.env.*
+!.env.example
+/data/
