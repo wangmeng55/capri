@@ -1,0 +1,23 @@
+goos: windows
+goarch: amd64
+pkg: github.com/AgentsHarness/capri-bench/micro
+cpu: AMD Ryzen 7 4800U with Radeon Graphics         
+BenchmarkDeflatePayload1KB-16                 	   39696	     11263 ns/op	  90.92 MB/s	     128 B/op	       1 allocs/op
+BenchmarkDeflatePayload64KB-16                	    3201	    112199 ns/op	 584.11 MB/s	     755 B/op	       1 allocs/op
+BenchmarkDeflatePayload1MB-16                 	     194	   1706094 ns/op	 614.61 MB/s	    4911 B/op	       1 allocs/op
+BenchmarkInflateUplink1KB-16                  	   21502	     16820 ns/op	  60.88 MB/s	   40636 B/op	       5 allocs/op
+BenchmarkInflateUplink64KB-16                 	   10000	     31373 ns/op	2088.95 MB/s	   40611 B/op	       5 allocs/op
+BenchmarkInflateUplink1MB-16                  	    1813	    188625 ns/op	5559.06 MB/s	   40576 B/op	       5 allocs/op
+BenchmarkFlowWindowWaitFastPath-16            	 1501551	       292.7 ns/op	     144 B/op	       3 allocs/op
+BenchmarkFlowWindowWaitCanceled-16            	  277214	      1441 ns/op	     241 B/op	       5 allocs/op
+BenchmarkFlowWindowSetLimit-16                	34901767	        10.10 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMarshalEventsFrame-16                	    2780	    115254 ns/op	   14906 B/op	     437 allocs/op
+BenchmarkMarshalEventsFrameRawSameBatch-16    	   10000	     31584 ns/op	    9073 B/op	       6 allocs/op
+BenchmarkJSONMarshalEvent-16                  	  100257	      3465 ns/op	     416 B/op	      15 allocs/op
+BenchmarkJSONUnmarshalEvent-16                	   52461	      7466 ns/op	    1753 B/op	      38 allocs/op
+BenchmarkHeadersFromHTTP-16                   	  255858	      1633 ns/op	    1024 B/op	      12 allocs/op
+BenchmarkHeadersToHTTP-16                     	  325032	      1274 ns/op	     952 B/op	      14 allocs/op
+BenchmarkEncodeFrame-16                       	    3432	     96660 ns/op	 452.02 MB/s	   49193 B/op	       1 allocs/op
+BenchmarkDecodeFrame-16                       	    4293	     78416 ns/op	 559.14 MB/s	   49550 B/op	       2 allocs/op
+PASS
+ok  	github.com/AgentsHarness/capri-bench/micro	8.878s

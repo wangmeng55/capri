@@ -1,0 +1,14 @@
+goos: windows
+goarch: amd64
+pkg: github.com/AgentsHarness/capri-bench/module
+cpu: AMD Ryzen 7 4800U with Radeon Graphics         
+BenchmarkHubRegisterEventThroughput-16        	  218511	      1589 ns/op	    1086 B/op	       9 allocs/op
+BenchmarkHubRegisterRawEventsThroughput-16    	     922	    379935 ns/op	   78807 B/op	    1607 allocs/op
+BenchmarkHubBroadcastFanOut/subs=1-16         	 1931229	       198.5 ns/op	       4 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=8-16         	  100956	      3590 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=64-16        	   12786	     28813 ns/op	       1 B/op	       0 allocs/op
+BenchmarkTransportFrameRoundTrip/1KB-16       	   28479	     13871 ns/op	  73.82 MB/s	    7626 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/16KB-16      	    2206	    177550 ns/op	  92.28 MB/s	  117937 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/64KB-16      	     529	    669840 ns/op	  97.84 MB/s	  438863 B/op	       7 allocs/op
+PASS
+ok  	github.com/AgentsHarness/capri-bench/module	5.261s
