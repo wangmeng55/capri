@@ -38,6 +38,7 @@
 | **T2.1** | `marshalEventsFrame` 改用静态类型 `eventsFrameEnvelope`，消除 `map[string]any` 的反射与接口装箱 | `capri-transport/transport/client.go` | 130,255 → 52,978 ns；437 → 9 allocs |
 | **T2.2** | `flowWindow.wait` 快路径直接走互斥量判断，`context.AfterFunc` 只在真正需要挂起时注册 | `capri-transport/transport/tunnel_flow.go` | 260 → 12 ns；3 → 0 allocs |
 | **T2.5a** | `http.Server` 补 `IdleTimeout=120s`、`MaxHeaderBytes=1MB`（**不设全局 Read/WriteTimeout**，否则会切断 SSE 与长任务） | `capri-host/internal/server/http.go` | 配置项断言 |
+| **T2.5b** | `runGitCmd` 在调用方未提供 deadline 时默认套 30s 超时，覆盖全部 13 处调用（该函数本就使用 `exec.CommandContext`，缺的是默认预算） | `capri-host/internal/server/http_ext_git.go` | 构建通过；崩溃型挂起不再可能 |
 | **T3.1** | `compress/flate` → `klauspost/compress/flate`（transport 压缩 + hub 解压） | `client.go`、`capri-hub/cmd/capri-hub/main.go` | 64KB −69.3%，1MB −74.2%，1KB −19.0% |
 | **T3.2** | 事件帧热点改用 `goccy/go-json` | `client.go` | 见 T2.1 合成收益 |
 
@@ -147,7 +148,7 @@
 | `capri-transport` | ✅ | ✅ 全通过（hubstate / netinfo / transport）|
 | `capri-hub` | ✅ | ⚠️ 仅 `TestPersistFileMode` 失败（**A 点同样失败**：POSIX 权限位 0600 在 Windows 上不可表达）|
 | `capri-host` | ✅ | ⚠️ 失败集是 A 点的**子集**：acp 4 项、config 2 项、server 19 项，全部在 A 点复现（POSIX 路径/权限、未构建的 FE 资产、worktree 探测）。改造后 `TestSSEEventCarriesHostIDAndSeq` 反而通过 |
-| `-race` | ❌ | **无法执行**：`CGO_ENABLED=0`，系统无 gcc（Git for Windows 不自带；MSVC 不被 Go cgo 支持）。这是本次验证的最大缺口 |
+| `-race` | ✅ | 已安装 mingw-w64（WinLibs POSIX/UCRT，gcc 16.2.0）并启用 `CGO_ENABLED=1`。结果：`capri-transport` 全绿；`capri-hub` **无 DATA RACE**（仅预存 `TestPersistFileMode` 失败）；`capri-host/internal/server` **无 DATA RACE**（19 项预存失败）|
 
 **结论：未引入任何新的测试失败。**
 
@@ -157,12 +158,18 @@
 
 | 编号 | 内容 | 状态 |
 |---|---|---|
-| T2.3 | 配置/技能扫描 mtime 缓存 | 未实施 |
-| T2.4 | `bridge.Snapshot` 锁外深拷贝 | 未实施 |
-| T2.5b | 15 处 `runGitCmd` 增加 context 超时 | 未实施（仅完成 HTTP server 部分）|
+| T2.3 | 配置/技能扫描 mtime 缓存 | 未实施（见 §6.1）|
+| T2.4 | `bridge.Snapshot` 锁外深拷贝 | **核查后判定不宜实施**（见 §6.1）|
+| T2.5b | `runGitCmd` 超时 | ✅ 已实施（默认 30s，覆盖 13 处调用）|
 | T4.1–4.3 | httpx / maputil 抽取、bridge.go 拆分 | 未实施（工单明确"不参与性能门槛"，属结构性重构）|
 | T5 / L3 | 端到端场景 S1–S6 | 未执行（harness 已编译；需真实 hub+host 二进制与 mock 上游编排）|
-| — | `-race` 竞态验证 | 环境缺失（见 §5）|
+| — | `-race` 竞态验证 | ✅ 已完成（见 §5）|
+
+### 6.1 两项"未实施"的技术理由
+
+**T2.3（mtime 缓存）**：`scanExtensions` 被 `/api/extensions`、`/api/settings`、agents 列表共用，而 `TestSettingsUpdateEndpoint` 这类测试是"写文件 → 立即读回"。Windows 上 mtime 粒度较粗（部分文件系统 1–2s），缓存会在同一秒内的写入后返回旧值，直接破坏"写后读一致"。要做对必须引入内容哈希或显式失效通知（写入路径主动 invalidate），那是行为改动而非性能补丁，不适合与本次并发修复混在一起。
+
+**T2.4（Snapshot 锁外深拷贝）**：原建议把 `cloneAny(s.modes)` 移出 `b.mu`。核查后不可行——这些 map 会被 `readStdout` 在锁内原地修改，浅拷贝后到锁外再深拷贝，正好与写者并发读写同一个 map，属于**制造**数据竞争。当前"锁内深拷贝"是正确做法；要降低持锁时间，必须先把这些字段改为 copy-on-write（写者每次换新 map，读者取引用即可），这是结构性改动，不属于本工单的优化补丁。
 
 > 说明：三个并行子 agent 因模型不可用（`gpt-5.6-sol` / `kimi-k3` 不存在）全部失败，上述工作由主 agent 直接完成，覆盖范围受此限制。
 
@@ -191,4 +198,5 @@ git switch perf/optimization   # 9589794
 1. **性能目标达成且可量化**：事件帧编码 2.46×、流控快路径 21.7×（零分配）、上行压缩 3.1–3.3×。
 2. **12 项 P0 缺陷全部处理**（其中 T1.11 经核查为已修复，无需改动），并配有 8 组回归测试。
 3. **未引入新的测试失败**（失败集与 A 点一致或更小）。
-4. **两个缺口必须补**：`-race` 环境（并发修复目前只有功能测试背书）、L3 端到端（真实二进制延迟/吞吐未测）。
+4. **`-race` 已完成**：transport 全绿，hub 与 host 均无 DATA RACE 报告。
+5. **唯一剩余缺口是 L3 端到端**：真实 hub+host 二进制的延迟分位与吞吐（S1–S6）尚未测量；单机微基准不能替代端到端结论。

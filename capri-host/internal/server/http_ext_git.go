@@ -680,9 +680,20 @@ func (s *Server) handleWorktreeDbPath(w http.ResponseWriter, r *http.Request) {
 }
 
 // runGitCmd executes git plumbing or commands in cwd and returns trimmed stdout/stderr.
+// gitCommandTimeout bounds a single git invocation. Without it a hung git
+// (credential prompt on a remote, a stale index.lock, a wedged filesystem)
+// pins the HTTP handler goroutine forever. A caller that already carries a
+// deadline in ctx keeps its own budget.
+const gitCommandTimeout = 30 * time.Second
+
 func runGitCmd(ctx context.Context, cwd string, args ...string) (string, error) {
 	if cwd == "" {
 		return "", fmt.Errorf("cwd 不能为空")
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, gitCommandTimeout)
+		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", cwd}, args...)...)
 	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
