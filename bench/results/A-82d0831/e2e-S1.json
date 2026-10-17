@@ -1,0 +1,15 @@
+{
+  "scenario": "S1-tunnel",
+  "target": "in-process",
+  "n": 2000,
+  "warmup": 100,
+  "started": "2026-10-18T04:27:36.2321954+08:00",
+  "duration": 100.2463,
+  "p50ms": 0,
+  "p95ms": 0.3558,
+  "p99ms": 1.0046,
+  "minMs": 0,
+  "maxMs": 1.5153,
+  "meanMs": 0.04299794999999999,
+  "errors": 0
+}

@@ -1,0 +1,16 @@
+{
+  "scenario": "S3-tunnel",
+  "target": "in-process",
+  "n": 60,
+  "warmup": 5,
+  "started": "2026-10-18T04:27:36.9606594+08:00",
+  "duration": 30.1299,
+  "p50ms": 0.5359,
+  "p95ms": 1.0973,
+  "p99ms": 1.6737,
+  "minMs": 0,
+  "maxMs": 1.6737,
+  "meanMs": 0.46469333333333335,
+  "errors": 0,
+  "notes": "9026.0 MB/s (4.19 MB per request)"
+}

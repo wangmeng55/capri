@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -119,10 +120,12 @@ func runS1(client *http.Client, target string, n, warmup int) Summary {
 
 func main() {
 	var (
-		scenario = flag.String("scenario", "S1", "scenario id (S1..S6); only S1 is wired in T0.2")
-		target   = flag.String("target", "http://127.0.0.1:8787/global/health", "target URL")
+		scenario = flag.String("scenario", "S1", "scenario id: S1 (round-trip), S3 (large body)")
+		mode     = flag.String("mode", "tunnel", "S1 mode: tunnel (in-process transport) or http (raw GET to -target)")
+		target   = flag.String("target", "http://127.0.0.1:8787/global/health", "target URL (mode=http only)")
 		n        = flag.Int("n", 200, "measured iterations")
 		warmup   = flag.Int("warmup", 20, "warmup iterations (discarded)")
+		bodySize = flag.Int("body", 4<<20, "S3 upload size in bytes")
 		out      = flag.String("out", "", "optional path to write JSON summary")
 		timeout  = flag.Duration("timeout", 10*time.Second, "per-request timeout")
 	)
@@ -133,13 +136,21 @@ func main() {
 	var sum Summary
 	switch *scenario {
 	case "S1":
-		sum = runS1(client, *target, *n, *warmup)
+		if *mode == "http" {
+			sum = runS1(client, *target, *n, *warmup)
+		} else {
+			// 512B fixed response: measures pure round-trip overhead
+			// (frames + flow control + HTTP relay), not payload throughput.
+			sum = runTunnelS1(bytes.Repeat([]byte("y"), 512), *n, *warmup)
+		}
+	case "S3":
+		sum = runTunnelS3(*bodySize, *n, *warmup)
 	default:
 		sum = Summary{
 			Scenario: *scenario,
 			Target:   *target,
 			Started:  time.Now(),
-			Notes:    "scenario stubbed in T0.2; harness contract is fixed but the bring-up lands in T0.3",
+			Notes:    "unknown scenario; supported: S1, S3",
 		}
 	}
 
