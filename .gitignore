@@ -1,5 +1,6 @@
 # Local toolchain and workspace-only material
-/tools/
+/tools/*
+!/tools/deploy-hub.ps1
 /分析/
 
 # Local Go caches and workspaces

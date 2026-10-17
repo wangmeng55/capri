@@ -10,9 +10,13 @@
     body { margin:0; font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); height:100dvh; }
     header { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--line); }
     header .brand { font-weight:600; letter-spacing:.02em; }
-    main { display:grid; grid-template-columns: 280px 1fr; height:calc(100dvh - 49px); }
-    aside { border-right:1px solid var(--line); overflow:auto; padding:10px; }
-    section.view { position:relative; background:#fff; }
+    #toggleHosts { width:100%; min-height:36px; padding:6px 10px; font-size:18px; line-height:1.2; }
+    main { display:grid; grid-template-columns: 280px minmax(0, 1fr); height:calc(100dvh - 49px); }
+    #app.sidebar-collapsed main { grid-template-columns: 48px minmax(0, 1fr); }
+    aside { display:flex; flex-direction:column; gap:8px; border-right:1px solid var(--line); overflow:auto; padding:10px; }
+    #app.sidebar-collapsed aside#hosts { padding:6px; }
+    #app.sidebar-collapsed #hostList { display:none; }
+    section.view { position:relative; min-width:0; background:#fff; }
     iframe#frame { position:absolute; inset:0; width:100%; height:100%; border:0; background:#fff; }
     .empty { color:var(--mut); padding:18px; }
     button { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:8px 12px; font:inherit; cursor:pointer; }
@@ -47,24 +51,45 @@
       <button class="ghost" id="logout">Sign out</button>
     </header>
     <main>
-      <aside id="hosts"><div class="empty">Loading hosts…</div></aside>
+      <aside id="hosts">
+        <button class="ghost" id="toggleHosts" type="button" aria-controls="hostList" aria-expanded="true" aria-label="Hide host list" title="Hide host list">☰</button>
+        <div id="hostList"><div class="empty">Loading hosts…</div></div>
+      </aside>
       <section class="view" id="view">
         <div class="empty" id="viewHint">Select a host to begin.</div>
-        <iframe id="frame" title="agent view" hidden></iframe>
+        <iframe id="frame" name="frame" title="agent view" hidden></iframe>
       </section>
     </main>
   </div>
 
   <script>
     "use strict";
-    var state = { csrf: "", hosts: [] };
+    var state = { csrf: "", hosts: [], accessToken: sessionStorage.getItem("capri-fe-token") || "" };
 
     function $(id) { return document.getElementById(id); }
     function show(el, on) { el.hidden = !on; }
 
+    function setHostsCollapsed(collapsed, persist) {
+      $("app").classList.toggle("sidebar-collapsed", collapsed);
+      var toggle = $("toggleHosts");
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+      toggle.setAttribute("aria-label", collapsed ? "Show host list" : "Hide host list");
+      toggle.title = collapsed ? "Show host list" : "Hide host list";
+      if (persist) {
+        try { localStorage.setItem("capri-sidebar-collapsed", collapsed ? "true" : "false"); } catch (e) {}
+      }
+    }
+
+    $("toggleHosts").addEventListener("click", function () {
+      setHostsCollapsed(!$("app").classList.contains("sidebar-collapsed"), true);
+    });
+
+    try { setHostsCollapsed(localStorage.getItem("capri-sidebar-collapsed") === "true", false); } catch (e) {}
+
     async function api(path, opts) {
       opts = opts || {};
       opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+      if (state.accessToken && path !== "/api/auth/login") opts.headers.Authorization = "Bearer " + state.accessToken;
       if (state.csrf && opts.method && opts.method !== "GET") opts.headers["X-Capri-CSRF"] = state.csrf;
       var res = await fetch(path, opts);
       var data = null;
@@ -73,9 +98,10 @@
     }
 
     async function boot() {
+      if (!state.accessToken) { show($("login"), true); return; }
       var s = await api("/api/auth/session");
       if (s.ok && s.data) { state.csrf = s.data.csrf || ""; enterApp(); }
-      else { show($("login"), true); }
+      else { state.accessToken = ""; sessionStorage.removeItem("capri-fe-token"); show($("login"), true); }
     }
 
     function enterApp() {
@@ -90,6 +116,9 @@
       var token = $("token").value;
       var r = await api("/api/auth/login", { method: "POST", body: JSON.stringify({ token: token }) });
       if (!r.ok) { $("loginErr").textContent = (r.data && r.data.error) || ("login failed (" + r.status + ")"); return; }
+      state.accessToken = token;
+      sessionStorage.setItem("capri-fe-token", token);
+      $("token").value = "";
       state.csrf = (r.data && r.data.csrf) || "";
       state.hosts = [];
       enterApp();
@@ -97,22 +126,23 @@
 
     $("logout").addEventListener("click", async function () {
       await api("/api/auth/logout", { method: "POST" });
+      state.accessToken = ""; sessionStorage.removeItem("capri-fe-token");
       state.csrf = ""; state.hosts = [];
       $("frame").hidden = true; $("frame").src = "about:blank";
       show($("viewHint"), true);
-      $("hosts").innerHTML = "";
+      $("hostList").innerHTML = "";
       show($("app"), false); show($("login"), true);
     });
 
     async function loadHosts() {
       var r = await api("/api/hosts");
-      if (!r.ok) { $("hosts").innerHTML = '<div class="empty">Failed to load hosts (' + r.status + ').</div>'; return; }
+      if (!r.ok) { $("hostList").innerHTML = '<div class="empty">Failed to load hosts (' + r.status + ').</div>'; return; }
       state.hosts = (r.data && r.data.hosts) || [];
       renderHosts();
     }
 
     function renderHosts() {
-      var box = $("hosts");
+      var box = $("hostList");
       if (!state.hosts.length) { box.innerHTML = '<div class="empty">No hosts paired yet.</div>'; return; }
       box.innerHTML = "";
       state.hosts.forEach(function (h) {

@@ -62,6 +62,13 @@ const (
 	maxHostNameLen = 256
 )
 
+func inferHostKind(hostID string) string {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(hostID)), "opencode-") {
+		return "opencode"
+	}
+	return "grok"
+}
+
 // EventBufGrace is how long after a host disconnect we keep its gap-pull
 // buffer so a short blip can still be filled via GET /api/events. Zero
 // clears immediately (tests may shrink this).
@@ -126,6 +133,7 @@ type Event map[string]any
 type HostInfo struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
+	Kind     string `json:"kind,omitempty"`
 	Online   bool   `json:"online"`
 	Ready    bool   `json:"ready"`
 	// Busy: any session has a turn in flight (thinking / working).
@@ -327,6 +335,7 @@ type persistFile struct {
 type persistHost struct {
 	HostID   string `json:"hostId"`
 	HostName string `json:"hostName"`
+	Kind     string `json:"kind,omitempty"`
 	Ready    bool   `json:"ready"`
 	Port     int    `json:"port,omitempty"`
 }
@@ -345,8 +354,12 @@ func (h *Hub) load() {
 		if id == "" {
 			id = hid
 		}
+		kind := strings.ToLower(strings.TrimSpace(ph.Kind))
+		if kind == "" {
+			kind = inferHostKind(id)
+		}
 		h.hosts[id] = &hostState{
-			info: HostInfo{HostID: id, HostName: ph.HostName, Ready: ph.Ready, Port: ph.Port},
+			info: HostInfo{HostID: id, HostName: ph.HostName, Kind: kind, Ready: ph.Ready, Port: ph.Port},
 		}
 	}
 	// Restore tokens and hostState.token so re-pair after restart can
@@ -363,8 +376,8 @@ func (h *Hub) load() {
 		} else {
 			// Orphan token without a hosts entry — synthesize a minimal host
 			// so the token remains usable and re-pair can still revoke it.
-			h.hosts[hid] = &hostState{
-				info:  HostInfo{HostID: hid},
+				h.hosts[hid] = &hostState{
+				info:  HostInfo{HostID: hid, Kind: inferHostKind(hid)},
 				token: tok,
 			}
 		}
@@ -383,7 +396,7 @@ func (h *Hub) snapshotLocked() persistFile {
 		pf.Tokens[tok] = hid
 	}
 	for hid, hs := range h.hosts {
-		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Ready: hs.info.Ready, Port: hs.info.Port}
+		pf.Hosts[hid] = persistHost{HostID: hid, HostName: hs.info.HostName, Kind: hs.info.Kind, Ready: hs.info.Ready, Port: hs.info.Port}
 	}
 	return pf
 }
@@ -683,6 +696,13 @@ func (h *Hub) StartPairingCodeMaintainer(ctx context.Context) {
 // stored as HostInfo.Port (local HTTP listen port for FE localhost probe).
 // Omitted or out of range leaves any existing Port untouched on re-pair.
 func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
+	return h.PairWithKind(code, hostID, hostName, "", port...)
+}
+
+// PairWithKind is Pair with an explicit host adapter kind. Older clients may
+// omit kind; the host ID prefix is used to recognize opencode hosts, with Grok
+// remaining the default for existing clients.
+func (h *Hub) PairWithKind(code, hostID, hostName, kind string, port ...int) (string, error) {
 	listenPort := 0
 	if len(port) > 0 {
 		listenPort = port[0]
@@ -711,6 +731,14 @@ func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
 		h.mu.Unlock()
 		return "", fmt.Errorf("hostId 过长（上限 %d）", maxHostIDLen)
 	}
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind == "" {
+		kind = inferHostKind(hostID)
+	}
+	if kind != "grok" && kind != "opencode" {
+		h.mu.Unlock()
+		return "", errors.New("kind 必须是 grok 或 opencode")
+	}
 	if len(hostName) > maxHostNameLen {
 		h.mu.Unlock()
 		return "", fmt.Errorf("hostName 过长（上限 %d）", maxHostNameLen)
@@ -720,6 +748,7 @@ func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
 		// after a pre-fix restart load).
 		h.revokeTokensForHostLocked(hostID)
 		hs.info.HostName = hostName
+		hs.info.Kind = kind
 		hs.info.LastSeen = time.Now()
 		if listenPort > 0 && listenPort <= 65535 {
 			hs.info.Port = listenPort
@@ -729,7 +758,7 @@ func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
 			h.mu.Unlock()
 			return "", ErrHostLimit
 		}
-		info := HostInfo{HostID: hostID, HostName: hostName, LastSeen: time.Now()}
+		info := HostInfo{HostID: hostID, HostName: hostName, Kind: kind, LastSeen: time.Now()}
 		if listenPort > 0 && listenPort <= 65535 {
 			info.Port = listenPort
 		}

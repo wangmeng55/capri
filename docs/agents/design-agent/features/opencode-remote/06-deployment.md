@@ -29,6 +29,26 @@ go build -o opencode-host.exe ./cmd/opencode-host
 ```
 （或运行 `tools\build-host.ps1`。）
 
+### Windows 一键部署 Hub 到 VPS
+
+仓库根目录执行：
+
+```powershell
+.\tools\deploy-hub.ps1
+```
+
+脚本使用 `tools\goenv.ps1` 的 Go 工具链与缓存，构建 Linux amd64 版 Hub，上传到
+`azureuser@52.253.97.90`，然后重启 `capri-hub` 服务并检查状态。默认 SSH 私钥为
+`$env:USERPROFILE\Downloads\xidian-linux_key.pem`。如服务器或密钥路径不同，可覆盖参数：
+
+```powershell
+.\tools\deploy-hub.ps1 -Vps "azureuser@服务器IP" -SshKey "D:\\路径\\服务器密钥.pem"
+```
+
+部署前需保证 Windows 已安装 OpenSSH Client，SSH 密钥可以免交互登录，且远端账户有
+`sudo systemctl` 权限。脚本会保留上一版二进制为 `capri-hub-linux-amd64.bak`；如果新版本
+启动失败，会尝试恢复上一版。
+
 ## 3. hub 配置（环境变量）
 
 | 变量 | 说明 |

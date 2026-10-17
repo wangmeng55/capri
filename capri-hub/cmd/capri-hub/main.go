@@ -423,13 +423,14 @@ func handlePair(h *hub.Hub, lim *pairLimiter) http.HandlerFunc {
 			Code     string `json:"code"`
 			HostID   string `json:"hostId"`
 			HostName string `json:"hostName"`
+			Kind     string `json:"kind,omitempty"`
 			Port     int    `json:"port"` // optional local HTTP listen port
 		}
 		if err := readJSON(r, &body); err != nil || body.Code == "" || body.HostID == "" {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "需要 code 和 hostId"})
 			return
 		}
-		token, err := h.Pair(body.Code, body.HostID, body.HostName, body.Port)
+		token, err := h.PairWithKind(body.Code, body.HostID, body.HostName, body.Kind, body.Port)
 		if err != nil {
 			status := 401
 			if errors.Is(err, hub.ErrHostLimit) {

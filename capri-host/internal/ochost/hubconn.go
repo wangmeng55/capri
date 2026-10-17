@@ -66,6 +66,10 @@ func runHubOnce(ctx context.Context, cfg HubConfig) error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", wsURL, err)
 	}
+	// Tunnel data frames carry up to MaxDecodedChunk bytes as base64 JSON,
+	// which is larger than coder/websocket's 32 KiB default read limit.
+	// Keep the WebSocket limit aligned with the tunnel codec on both ends.
+	c.SetReadLimit(transport.MaxWireFrame)
 	log.Printf("[opencode-host] data connection established to %s", wsURL)
 
 	agent := transport.NewTunnelHostAgent("ws-"+cfg.HostID, transport.NewWSFrameConn(c), cfg.Target, cfg.BodyLimit)

@@ -1,14 +1,20 @@
 package ochost
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"io"
-	"strings"
 	"net"
 	"net/http"
+	"path"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
+
+var hashedAssetName = regexp.MustCompile(`-[A-Za-z0-9_-]{8,}\.`)
 
 // LocalProxy forwards transparent requests to a fixed loopback opencode server,
 // injecting the host-local Basic credential. It implements
@@ -68,6 +74,10 @@ func (p *LocalProxy) ForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header = r.Header.Clone()
 	p.sanitize(req.Header)
+	// OpenCode serves large frontend assets without compression. Keep the
+	// loopback response uncompressed so this host can gzip it before sending
+	// the bytes over Capri's bandwidth-limited tunnel.
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := p.client.Do(req)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
@@ -76,11 +86,90 @@ func (p *LocalProxy) ForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	copyResponseHeaders(w.Header(), resp.Header)
+	if isHashedFrontendAsset(r.URL.Path) {
+		// OpenCode's frontend uses content-hashed asset names, so these files
+		// can be cached privately for a year without serving stale code after
+		// an upgrade. Keep this off API responses and unhashed assets.
+		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	}
+	if shouldGzipResponse(r, resp) {
+		h := w.Header()
+		h.Del("Content-Length")
+		h.Del("Content-MD5")
+		h.Del("ETag")
+		h.Del("Accept-Ranges")
+		h.Set("Content-Encoding", "gzip")
+		addVary(h, "Accept-Encoding")
+		w.WriteHeader(resp.StatusCode)
+		gz, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		_, _ = io.Copy(gz, resp.Body)
+		_ = gz.Close()
+		return
+	}
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
 		return
 	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func isHashedFrontendAsset(requestPath string) bool {
+	if !strings.HasPrefix(requestPath, "/assets/") {
+		return false
+	}
+	name := path.Base(requestPath)
+	return name != "." && name != "/" && hashedAssetName.MatchString(name)
+}
+
+func shouldGzipResponse(req *http.Request, resp *http.Response) bool {
+	if req.Method != http.MethodGet || req.Header.Get("Range") != "" ||
+		resp.StatusCode != http.StatusOK || resp.ContentLength < 1024 ||
+		resp.Header.Get("Content-Encoding") != "" || !acceptsGzip(req.Header.Get("Accept-Encoding")) {
+		return false
+	}
+	contentType := strings.ToLower(strings.TrimSpace(strings.SplitN(resp.Header.Get("Content-Type"), ";", 2)[0]))
+	if contentType == "text/event-stream" {
+		return false
+	}
+	return strings.HasPrefix(contentType, "text/") ||
+		strings.Contains(contentType, "javascript") ||
+		strings.Contains(contentType, "json") ||
+		strings.Contains(contentType, "xml") ||
+		strings.Contains(contentType, "wasm") ||
+		strings.HasPrefix(contentType, "font/") ||
+		strings.Contains(contentType, "font-woff")
+}
+
+func acceptsGzip(header string) bool {
+	for _, item := range strings.Split(header, ",") {
+		parts := strings.SplitN(strings.TrimSpace(item), ";", 2)
+		if !strings.EqualFold(strings.TrimSpace(parts[0]), "gzip") {
+			continue
+		}
+		if len(parts) == 1 {
+			return true
+		}
+		for _, param := range strings.Split(parts[1], ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if ok && strings.EqualFold(strings.TrimSpace(name), "q") {
+				q, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+				return err == nil && q > 0
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func addVary(h http.Header, value string) {
+	for _, header := range h.Values("Vary") {
+		for _, item := range strings.Split(header, ",") {
+			if strings.EqualFold(strings.TrimSpace(item), value) {
+				return
+			}
+		}
+	}
+	h.Add("Vary", value)
 }
 
 func copyResponseHeaders(dst, src http.Header) {

@@ -125,6 +125,10 @@ func (d *DataPlane) HandleHostTunnel(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	// Tunnel data frames carry up to MaxDecodedChunk bytes as base64 JSON,
+	// which is larger than coder/websocket's 32 KiB default read limit.
+	// Keep the WebSocket limit aligned with the tunnel codec on both ends.
+	c.SetReadLimit(transport.MaxWireFrame)
 	connID := randID()
 	tc := transport.NewTunnelClient(connID, transport.NewWSFrameConn(c), d.bodyLimit)
 	tc.Start()
