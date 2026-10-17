@@ -485,7 +485,12 @@ func (s *feTicketStore) StartCleanup(ctx context.Context) {
 
 func (s *feTicketStore) issue() (ticket string, expires time.Time) {
 	var b [24]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		// Never mint a ticket from a partially-filled buffer: on error the
+		// remainder is all zeroes, which would make the ticket predictable.
+		// An empty ticket tells the caller to fail the request.
+		return "", time.Time{}
+	}
 	ticket = hex.EncodeToString(b[:])
 	expires = time.Now().Add(feTicketTTL)
 	s.mu.Lock()
@@ -512,6 +517,10 @@ func (s *feTicketStore) consume(ticket string) bool {
 func handleWSTicket(tickets *feTicketStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ticket, exp := tickets.issue()
+		if ticket == "" {
+			writeJSON(w, 500, map[string]any{"ok": false, "error": "无法生成票据"})
+			return
+		}
 		writeJSON(w, 200, map[string]any{
 			"ok":        true,
 			"ticket":    ticket,
@@ -1726,9 +1735,16 @@ func withCORS(next http.Handler, origins []string) http.Handler {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Access-Token")
 		if len(origins) == 0 {
+			// No allow-list configured: open CORS. Credentials must stay OFF
+			// here — browsers reject "Access-Control-Allow-Origin: *" combined
+			// with "Access-Control-Allow-Credentials: true", which would break
+			// every cross-origin request instead of enabling cookies.
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		} else if origin := r.Header.Get("Origin"); origin != "" && corsOriginAllowed(origin, origins) {
+			// Echo the concrete origin so credentialed requests (cookies) are
+			// legal; a wildcard origin can never carry credentials.
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {

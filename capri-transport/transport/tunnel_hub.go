@@ -62,13 +62,23 @@ func (c *TunnelClient) readLoop() {
 }
 
 func (c *TunnelClient) dispatch(f *Frame) {
+	// Hold the lock across the send. failAll() closes every subscriber
+	// channel under the same lock, so a dispatch that looked the channel up
+	// and then sent outside the lock could hit a closed channel and panic
+	// the whole process. The send is non-blocking: a subscriber that is
+	// already 1024 frames behind is stalled, and blocking here would stop
+	// the connection's read loop for every other request on it.
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	ch := c.subs[f.ReqID]
-	c.mu.Unlock()
-	if ch == nil {
+	if ch == nil || c.closed {
 		return // late frame for a finished/unknown request: tombstone drop
 	}
-	ch <- f
+	select {
+	case ch <- f:
+	default:
+		// Backlog full: drop rather than stall the shared read loop.
+	}
 }
 
 func (c *TunnelClient) failAll(err error) {

@@ -56,6 +56,17 @@ func New(cfg config.Config, bridge bridgeAPI) *Server {
 		Addr:              net.JoinHostPort(bindAddrOf(cfg), strconv.Itoa(cfg.Port)),
 		Handler:           s.handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		// IdleTimeout reaps keep-alive connections that stop sending
+		// requests; without it a stalled client pins a goroutine and a
+		// socket indefinitely.
+		IdleTimeout: 120 * time.Second,
+		// MaxHeaderBytes caps the request-line + header block so a single
+		// connection cannot make the server buffer an unbounded header set.
+		MaxHeaderBytes: 1 << 20,
+		// No global ReadTimeout/WriteTimeout on purpose: this server proxies
+		// long-lived SSE streams and long-running prompt round-trips, and
+		// either one would sever them mid-flight. ReadHeaderTimeout above
+		// already covers the slow-header (Slowloris) case.
 	}
 	return s
 }
@@ -777,7 +788,13 @@ func (s *Server) handleClientResponse(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	var sc acp.SessionConfig
-	_ = readJSON(r, &sc)
+	if err := readJSON(r, &sc); err != nil {
+		// A malformed body used to be ignored and a session still created
+		// with zero-value config — the caller then saw "ok" for a request
+		// it never described. Reject it instead.
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "无效 JSON: " + err.Error()})
+		return
+	}
 	if err := s.bridge.NewSession(r.Context(), sc); err != nil {
 		writeAgentError(w, "session/new", err)
 		return

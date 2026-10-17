@@ -41,6 +41,12 @@ type hostReq struct {
 	sender   FrameSender
 	closed   bool
 	sendFail error
+
+	// bodyMu guards bodyErr: the first failure writing the browser→host
+	// payload into the local upstream. Previously these writes returned nil
+	// on error, so the feeder goroutine never learned the request was dead.
+	bodyMu  sync.Mutex
+	bodyErr error
 }
 
 func newHostReq(parent context.Context, connID string, f *Frame, send FrameSender) *hostReq {
@@ -93,6 +99,25 @@ func (hr *hostReq) sendErr() error {
 	return hr.sendFail
 }
 
+// setBodyErr records the first upstream write failure and returns true when
+// it was the first one (so the caller can tear the request down exactly once).
+func (hr *hostReq) setBodyErr(err error) bool {
+	hr.bodyMu.Lock()
+	defer hr.bodyMu.Unlock()
+	if hr.bodyErr != nil {
+		return false
+	}
+	hr.bodyErr = err
+	return true
+}
+
+// bodyWriteErr reports the recorded upstream write failure (nil if none).
+func (hr *hostReq) bodyWriteErr() error {
+	hr.bodyMu.Lock()
+	defer hr.bodyMu.Unlock()
+	return hr.bodyErr
+}
+
 // feed handles request-data: write to the upstream body pipe and ack the lane.
 func (hr *hostReq) feed(f *Frame) error {
 	p, err := f.payload()
@@ -108,7 +133,14 @@ func (hr *hostReq) feed(f *Frame) error {
 		return nil
 	}
 	if _, err := hr.bodyW.Write(p); err != nil {
-		return nil // upstream stopped reading; terminal handled elsewhere
+		// The local handler stopped reading: the request can never complete,
+		// so record the error and cancel the request context. Returning nil
+		// here (the old behaviour) left every waiter blocked until the
+		// relay timeout with no way to observe the failure.
+		if hr.setBodyErr(err) {
+			hr.cancel()
+		}
+		return nil
 	}
 	if limit, ok := hr.reqAck.advance(int64(len(p))); ok {
 		hr.send(&Frame{ConnID: hr.connID, ReqID: hr.reqID, Op: OpWindowUpdate, Lane: LaneRequest, AckOffset: hr.reqAck.ack, LimitOffset: limit})
@@ -133,6 +165,11 @@ func (hr *hostReq) wsUp(f *Frame) error {
 		return nil
 	}
 	if _, err := hr.upConn.Write(p); err != nil {
+		// Same contract as feed: a dead upstream websocket must terminate the
+		// request instead of being silently ignored.
+		if hr.setBodyErr(err) {
+			hr.cancel()
+		}
 		return nil
 	}
 	if limit, ok := hr.wsUpAck.advance(int64(len(p))); ok {

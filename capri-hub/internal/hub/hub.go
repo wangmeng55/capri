@@ -40,6 +40,12 @@ const (
 	// RelayTimeout caps how long the hub waits for a host to answer a
 	// relayed request (mirrors the host's 30-minute prompt timeout).
 	RelayTimeout = 45 * time.Minute
+	// maxPendingPerHost bounds a single host's in-flight relayed requests.
+	// Each pending entry also pins a waiter goroutine and a RelayTimeout
+	// timer, so an unbounded map is both a memory and a goroutine leak: a
+	// flaky browser retrying prompts (or a hostile client) could grow it
+	// until the hub runs out of room. 256 is far above any real fan-in.
+	maxPendingPerHost = 256
 	// eventBufCap bounds per-host buffered events for gap-pull. It MUST
 	// stay ≥ the host's replay ring (capri-host internal/hub replayCap =
 	// 1000): after a long disconnect the host replays up to its whole
@@ -206,10 +212,17 @@ type hostState struct {
 	// host socket, back-pressuring the host's entire uplink (events, responds,
 	// host_status) for every browser, not just the slow one.
 	//
-	// fanout is created (and its goroutine started) by fanoutOnce on the
+	// fanout is created (and its goroutine started) by enqueueFanout on the
 	// first enqueue, so hosts that never receive an event cost nothing.
+	//
+	// fanoutMu guards the lazy start and the stop below. The event channel
+	// is never closed: a late enqueue after stopFanout must not panic, it
+	// just fills and then drops (see fanoutDropped). The goroutine exits via
+	// fanoutDone, which Unpair closes — otherwise every unpaired host would
+	// leave one goroutine ranging over a channel nobody feeds.
+	fanoutMu   sync.Mutex
 	fanout     chan Event
-	fanoutOnce sync.Once
+	fanoutDone chan struct{}
 	// fanoutDropped counts events dropped because the fan-out queue was
 	// full. The event is already in evBuf, so a FE's (hostId,seq) gap-pull
 	// recovers it — this is not a loss, just deferred delivery.
@@ -225,18 +238,46 @@ const hostFanoutCap = 2048
 // host's fan-out goroutine. Never blocks: a slow browser must not stall the
 // host read loop (see hostState.fanout).
 func (hs *hostState) enqueueFanout(h *Hub, ev Event) {
-	hs.fanoutOnce.Do(func() {
-		hs.fanout = make(chan Event, hostFanoutCap)
+	hs.fanoutMu.Lock()
+	if hs.fanout == nil {
+		ch := make(chan Event, hostFanoutCap)
+		done := make(chan struct{})
+		hs.fanout = ch
+		hs.fanoutDone = done
 		go func() {
-			for e := range hs.fanout {
-				h.broadcast(e)
+			for {
+				select {
+				case <-done:
+					return
+				case e := <-ch:
+					h.broadcast(e)
+				}
 			}
 		}()
-	})
+	}
+	ch := hs.fanout
+	hs.fanoutMu.Unlock()
+
 	select {
-	case hs.fanout <- ev:
+	case ch <- ev:
 	default:
 		hs.fanoutDropped.Add(1)
+	}
+}
+
+// stopFanout terminates the per-host fan-out goroutine. Called from Unpair,
+// which removes the hostState from the registry — without this the goroutine
+// would range over hs.fanout forever. The channel is deliberately NOT
+// closed: an in-flight enqueue that lost the race must not panic, and the
+// now-unreachable channel is reclaimed by the GC with the hostState.
+func (hs *hostState) stopFanout() {
+	hs.fanoutMu.Lock()
+	done := hs.fanoutDone
+	hs.fanout = nil
+	hs.fanoutDone = nil
+	hs.fanoutMu.Unlock()
+	if done != nil {
+		close(done)
 	}
 }
 
@@ -346,7 +387,16 @@ func (h *Hub) load() {
 		return
 	}
 	var pf persistFile
-	if json.Unmarshal(b, &pf) != nil {
+	if err := json.Unmarshal(b, &pf); err != nil {
+		// A corrupt persistence file used to be ignored silently, so the
+		// next write clobbered every pairing and token with an empty
+		// snapshot. Preserve the evidence first, then start clean.
+		bad := fmt.Sprintf("%s.bad-%d", h.dataFile, time.Now().Unix())
+		if rerr := os.Rename(h.dataFile, bad); rerr != nil {
+			log.Printf("[capri-hub] 持久化文件损坏且无法备份（%v）: %v", rerr, err)
+			return
+		}
+		log.Printf("[capri-hub] 持久化文件损坏，已备份为 %s: %v", bad, err)
 		return
 	}
 	for hid, ph := range pf.Hosts {
@@ -799,6 +849,7 @@ func (h *Hub) Unpair(hostID string) error {
 	hs.conn = nil
 	delete(h.hosts, hostID)
 	delete(h.lastNotifiedSubs, hostID)
+	hs.stopFanout()
 	hs.mu.Lock()
 	hs.evBuf = nil
 	hs.mu.Unlock()
@@ -1431,6 +1482,10 @@ func (h *Hub) Dispatch(ctx context.Context, hostID, method, path string, body js
 		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 当前离线", hostID)}
 	}
 	pr := &pendingReq{resp: make(chan RelayResponse, 1), done: make(chan struct{})}
+	if len(h.pending[hostID]) >= maxPendingPerHost {
+		h.mu.Unlock()
+		return RelayResponse{}, &RelayError{Status: 503, Message: fmt.Sprintf("host %s 待处理请求过多，请稍后重试", hostID)}
+	}
 	if h.pending[hostID] == nil {
 		h.pending[hostID] = make(map[string]*pendingReq)
 	}
@@ -1487,13 +1542,14 @@ func (h *Hub) dropPending(hostID, reqID string) {
 // Respond resolves a relayed request with the host's answer.
 func (h *Hub) Respond(hostID, reqID string, resp RelayResponse) bool {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	m := h.pending[hostID]
 	if m == nil {
+		h.mu.Unlock()
 		return false
 	}
 	pr, ok := m[reqID]
 	if !ok {
+		h.mu.Unlock()
 		return false
 	}
 	delete(m, reqID)
@@ -1503,6 +1559,12 @@ func (h *Hub) Respond(hostID, reqID string, resp RelayResponse) bool {
 	if hs := h.hosts[hostID]; hs != nil {
 		hs.info.LastSeen = time.Now()
 	}
+	h.mu.Unlock()
+
+	// Send OUTSIDE h.mu. The entry is already detached, so no concurrent
+	// Respond can reach this pr; a slow receiver therefore cannot serialize
+	// every other relay operation behind the global hub lock. The channel is
+	// buffered (cap 1) so this never blocks in practice.
 	pr.resp <- resp
 	return true
 }

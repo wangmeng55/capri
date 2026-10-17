@@ -30,7 +30,29 @@ func newFlowWindow(initial int64) *flowWindow {
 
 // wait blocks until endOffset <= limit, ctx is done, or the window is closed.
 // endOffset is the offset AFTER the block being sent.
+//
+// The common case — the window already has room — is answered by a plain
+// mutex check with NO context.AfterFunc registration, which is where the
+// previous version spent 3 allocations and a closure on every block send.
+// Only a caller that actually has to park pays for the cancellation hook.
 func (w *flowWindow) wait(ctx context.Context, endOffset int64) error {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return errWindowClosed
+	}
+	if endOffset <= w.limit {
+		w.mu.Unlock()
+		return nil
+	}
+	w.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// Slow path: park until the limit grows, the window closes, or ctx ends.
+	// Registering the wake-up only here keeps the hot path allocation-free.
 	stop := context.AfterFunc(ctx, func() {
 		w.mu.Lock()
 		w.cond.Broadcast()
