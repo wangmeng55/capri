@@ -1,0 +1,30 @@
+goos: windows
+goarch: amd64
+pkg: github.com/AgentsHarness/capri-bench/module
+cpu: AMD Ryzen 7 4800U with Radeon Graphics         
+BenchmarkHubRegisterEventThroughput-16        	  193766	      1581 ns/op	    1086 B/op	       9 allocs/op
+BenchmarkHubRegisterEventThroughput-16        	  224912	      1451 ns/op	    1085 B/op	       9 allocs/op
+BenchmarkHubRegisterEventThroughput-16        	  233474	      1395 ns/op	    1086 B/op	       9 allocs/op
+BenchmarkHubRegisterRawEventsThroughput-16    	    1033	    320349 ns/op	   78815 B/op	    1607 allocs/op
+BenchmarkHubRegisterRawEventsThroughput-16    	    1141	    320229 ns/op	   78800 B/op	    1607 allocs/op
+BenchmarkHubRegisterRawEventsThroughput-16    	     955	    351929 ns/op	   78779 B/op	    1606 allocs/op
+BenchmarkHubBroadcastFanOut/subs=1-16         	 2080462	       180.3 ns/op	       5 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=1-16         	 2133378	       158.7 ns/op	       6 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=1-16         	 2290692	       163.4 ns/op	       6 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=8-16         	   89802	      4028 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=8-16         	   88845	      4041 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=8-16         	   90612	      3973 ns/op	       0 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=64-16        	   12416	     29076 ns/op	       1 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=64-16        	   12253	     30001 ns/op	       1 B/op	       0 allocs/op
+BenchmarkHubBroadcastFanOut/subs=64-16        	   12454	     28706 ns/op	       1 B/op	       0 allocs/op
+BenchmarkTransportFrameRoundTrip/1KB-16       	   29653	     11380 ns/op	  89.98 MB/s	    7622 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/1KB-16       	   30702	     13561 ns/op	  75.51 MB/s	    7620 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/1KB-16       	   31438	     11382 ns/op	  89.97 MB/s	    7621 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/16KB-16      	    2690	    128009 ns/op	 127.99 MB/s	  117690 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/16KB-16      	    3033	    129136 ns/op	 126.87 MB/s	  117644 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/16KB-16      	    3112	    157310 ns/op	 104.15 MB/s	  117618 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/64KB-16      	     693	    504368 ns/op	 129.94 MB/s	  437311 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/64KB-16      	     734	    497393 ns/op	 131.76 MB/s	  436913 B/op	       7 allocs/op
+BenchmarkTransportFrameRoundTrip/64KB-16      	     728	    502530 ns/op	 130.41 MB/s	  436166 B/op	       7 allocs/op
+PASS
+ok  	github.com/AgentsHarness/capri-bench/module	13.062s

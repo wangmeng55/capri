@@ -1,0 +1,57 @@
+goos: windows
+goarch: amd64
+pkg: github.com/AgentsHarness/capri-bench/micro
+cpu: AMD Ryzen 7 4800U with Radeon Graphics         
+BenchmarkDeflatePayload1KB-16                 	   45136	      8277 ns/op	 123.72 MB/s	     128 B/op	       1 allocs/op
+BenchmarkDeflatePayload1KB-16                 	   42638	      7919 ns/op	 129.31 MB/s	     153 B/op	       1 allocs/op
+BenchmarkDeflatePayload1KB-16                 	   47053	      7634 ns/op	 134.13 MB/s	     151 B/op	       1 allocs/op
+BenchmarkDeflatePayload64KB-16                	    3801	    104299 ns/op	 628.35 MB/s	     701 B/op	       1 allocs/op
+BenchmarkDeflatePayload64KB-16                	    3146	     98533 ns/op	 665.12 MB/s	     761 B/op	       1 allocs/op
+BenchmarkDeflatePayload64KB-16                	    3561	     99358 ns/op	 659.59 MB/s	     417 B/op	       1 allocs/op
+BenchmarkDeflatePayload1MB-16                 	     199	   1638559 ns/op	 639.94 MB/s	    4910 B/op	       1 allocs/op
+BenchmarkDeflatePayload1MB-16                 	     198	   1607619 ns/op	 652.25 MB/s	   10402 B/op	       1 allocs/op
+BenchmarkDeflatePayload1MB-16                 	     211	   2039193 ns/op	 514.21 MB/s	   10061 B/op	       1 allocs/op
+BenchmarkInflateUplink1KB-16                  	   14198	     25110 ns/op	  40.78 MB/s	   40653 B/op	       5 allocs/op
+BenchmarkInflateUplink1KB-16                  	   13728	     24902 ns/op	  41.12 MB/s	   40653 B/op	       5 allocs/op
+BenchmarkInflateUplink1KB-16                  	   12972	     24160 ns/op	  42.38 MB/s	   40654 B/op	       5 allocs/op
+BenchmarkInflateUplink64KB-16                 	    9928	     33162 ns/op	1976.24 MB/s	   40621 B/op	       5 allocs/op
+BenchmarkInflateUplink64KB-16                 	   10000	     34170 ns/op	1917.96 MB/s	   40627 B/op	       5 allocs/op
+BenchmarkInflateUplink64KB-16                 	   10000	     36662 ns/op	1787.60 MB/s	   40634 B/op	       5 allocs/op
+BenchmarkInflateUplink1MB-16                  	    1568	    197707 ns/op	5303.69 MB/s	   40573 B/op	       5 allocs/op
+BenchmarkInflateUplink1MB-16                  	    1981	    166056 ns/op	6314.61 MB/s	   40572 B/op	       5 allocs/op
+BenchmarkInflateUplink1MB-16                  	    2124	    174893 ns/op	5995.54 MB/s	   40562 B/op	       5 allocs/op
+BenchmarkFlowWindowWaitFastPath-16            	 1507418	       259.6 ns/op	     144 B/op	       3 allocs/op
+BenchmarkFlowWindowWaitFastPath-16            	 1342176	       246.7 ns/op	     144 B/op	       3 allocs/op
+BenchmarkFlowWindowWaitFastPath-16            	 1572352	       225.2 ns/op	     144 B/op	       3 allocs/op
+BenchmarkFlowWindowWaitCanceled-16            	  249687	      1333 ns/op	     241 B/op	       5 allocs/op
+BenchmarkFlowWindowWaitCanceled-16            	  284773	      1404 ns/op	     240 B/op	       5 allocs/op
+BenchmarkFlowWindowWaitCanceled-16            	  257925	      1364 ns/op	     240 B/op	       5 allocs/op
+BenchmarkFlowWindowSetLimit-16                	31804647	         9.911 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFlowWindowSetLimit-16                	37144802	         9.586 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFlowWindowSetLimit-16                	38621636	        10.28 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMarshalEventsFrame-16                	    3154	    112039 ns/op	   14901 B/op	     437 allocs/op
+BenchmarkMarshalEventsFrame-16                	    2725	    127461 ns/op	   14906 B/op	     437 allocs/op
+BenchmarkMarshalEventsFrame-16                	    3529	    130255 ns/op	   14900 B/op	     437 allocs/op
+BenchmarkMarshalEventsFrameRawSameBatch-16    	   10000	     41455 ns/op	    9080 B/op	       6 allocs/op
+BenchmarkMarshalEventsFrameRawSameBatch-16    	   10827	     30650 ns/op	    9091 B/op	       6 allocs/op
+BenchmarkMarshalEventsFrameRawSameBatch-16    	   10000	     35477 ns/op	    9069 B/op	       6 allocs/op
+BenchmarkJSONMarshalEvent-16                  	   97436	      3551 ns/op	     416 B/op	      15 allocs/op
+BenchmarkJSONMarshalEvent-16                  	   93342	      3555 ns/op	     416 B/op	      15 allocs/op
+BenchmarkJSONMarshalEvent-16                  	  100276	      3375 ns/op	     416 B/op	      15 allocs/op
+BenchmarkJSONUnmarshalEvent-16                	   54451	      6900 ns/op	    1753 B/op	      38 allocs/op
+BenchmarkJSONUnmarshalEvent-16                	   51572	      8348 ns/op	    1754 B/op	      38 allocs/op
+BenchmarkJSONUnmarshalEvent-16                	   50713	      7074 ns/op	    1753 B/op	      38 allocs/op
+BenchmarkHeadersFromHTTP-16                   	  276302	      1477 ns/op	    1024 B/op	      12 allocs/op
+BenchmarkHeadersFromHTTP-16                   	  242698	      1522 ns/op	    1024 B/op	      12 allocs/op
+BenchmarkHeadersFromHTTP-16                   	  209380	      1560 ns/op	    1024 B/op	      12 allocs/op
+BenchmarkHeadersToHTTP-16                     	  277293	      1440 ns/op	     952 B/op	      14 allocs/op
+BenchmarkHeadersToHTTP-16                     	  323272	      1254 ns/op	     952 B/op	      14 allocs/op
+BenchmarkHeadersToHTTP-16                     	  316624	      1160 ns/op	     952 B/op	      14 allocs/op
+BenchmarkEncodeFrame-16                       	    4144	     89518 ns/op	 488.08 MB/s	   49201 B/op	       1 allocs/op
+BenchmarkEncodeFrame-16                       	    4495	     94627 ns/op	 461.73 MB/s	   49201 B/op	       1 allocs/op
+BenchmarkEncodeFrame-16                       	    3706	    101165 ns/op	 431.89 MB/s	   49205 B/op	       1 allocs/op
+BenchmarkDecodeFrame-16                       	    6441	     69710 ns/op	 628.96 MB/s	   49549 B/op	       2 allocs/op
+BenchmarkDecodeFrame-16                       	    5782	     70220 ns/op	 624.39 MB/s	   49548 B/op	       2 allocs/op
+BenchmarkDecodeFrame-16                       	    4816	     72863 ns/op	 601.74 MB/s	   49550 B/op	       2 allocs/op
+PASS
+ok  	github.com/AgentsHarness/capri-bench/micro	23.559s
