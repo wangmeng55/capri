@@ -13,7 +13,6 @@ package main
 
 import (
 	"bytes"
-	"compress/flate"
 	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
@@ -43,6 +42,7 @@ import (
 	"github.com/AgentsHarness/capri-hub/internal/hub"
 	"github.com/AgentsHarness/capri-hub/internal/transparent"
 	"github.com/coder/websocket"
+	"github.com/klauspost/compress/flate"
 	"github.com/quic-go/quic-go"
 )
 

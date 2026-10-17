@@ -8,6 +8,8 @@ require (
 )
 
 require (
+	github.com/goccy/go-json v0.11.2 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

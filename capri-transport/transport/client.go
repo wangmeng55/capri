@@ -6,7 +6,6 @@ package transport
 
 import (
 	"bytes"
-	"compress/flate"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -32,6 +31,8 @@ import (
 
 	"github.com/AgentsHarness/capri-transport/hubstate"
 	"github.com/coder/websocket"
+	goccyjson "github.com/goccy/go-json"
+	"github.com/klauspost/compress/flate"
 	"github.com/quic-go/quic-go"
 )
 
@@ -319,6 +320,14 @@ func NewClient(cfg Config) *Client {
 		// and the HTTP API before Run's first iteration, and a nil channel
 		// would make requestRepair's non-blocking send silently vanish.
 		repairCh: make(chan struct{}, 1),
+		// Also created here, not in Run: producers (event forwarding, the
+		// host-status heartbeat, relayed requests) can enqueue before Run
+		// enters its first session iteration. Assigning them inside Run was
+		// a data race against those producers, and a nil send channel would
+		// have silently dropped frames. drainSendCh at session start still
+		// discards stale frames from a previous session.
+		sendCh: make(chan []byte, 256),
+		reqCh:  make(chan reqFrame, 64),
 	}
 	c.name.Store(cfg.HostName)
 	return c
@@ -359,9 +368,6 @@ func (c *Client) Run(ctx context.Context, bridge EventSource) {
 	}
 	c.setLastErr(nil)
 	log.Printf("[hub-client] connected to hub %s as %s (%s)", c.cfg.URL, c.cfg.HostID, c.hostName())
-
-	c.sendCh = make(chan []byte, 256)
-	c.reqCh = make(chan reqFrame, 64)
 
 	// Bridge events → hub (async queue + batch; no text merge — dual-path seq).
 	fwdCtx, fwdCancel := context.WithCancel(ctx)
@@ -871,6 +877,21 @@ func (c *Client) noteHubAck(seq uint64) {
 	}
 }
 
+// eventsFrameEnvelope is the typed wire envelope for type:"events" frames.
+//
+// It is a concrete struct rather than map[string]any on purpose: the map
+// form made encoding/json reflect over an interface-typed outer container
+// and box four values per frame. A static layout removes that per-frame
+// allocation and keeps the marshal on a known field set. Field order
+// matches marshalEventsFrameRaw, so the live and replay producers emit
+// identical key order.
+type eventsFrameEnvelope struct {
+	V        int     `json:"v"`
+	Type     string  `json:"type"`
+	SeqStart uint64  `json:"seqStart"`
+	Events   []Event `json:"events"`
+}
+
 // marshalEventsFrame builds a type:"events" frame for evs, enforcing the
 // maxFrameBytes cap (an oversized frame would exceed the hub's read limit
 // and kill the connection, livelocking the resume — the replay buffer
@@ -878,11 +899,11 @@ func (c *Client) noteHubAck(seq uint64) {
 // frame cannot be built or must be dropped.
 func (c *Client) marshalEventsFrame(evs []Event) []byte {
 	first := eventSeq(evs[0])
-	payload, err := json.Marshal(map[string]any{
-		"v":        1,
-		"type":     "events",
-		"seqStart": uint64(first),
-		"events":   evs,
+	payload, err := goccyjson.Marshal(eventsFrameEnvelope{
+		V:        1,
+		Type:     "events",
+		SeqStart: uint64(first),
+		Events:   evs,
 	})
 	if err != nil {
 		return nil
@@ -1018,7 +1039,7 @@ func (c *Client) noteLastSentSeqItems(items []replayItem) {
 // event objects. json.RawMessage is emitted verbatim so replay does not
 // unmarshal into Event maps.
 func (c *Client) marshalEventsFrameRaw(seqStart uint64, raws []json.RawMessage) []byte {
-	payload, err := json.Marshal(struct {
+	payload, err := goccyjson.Marshal(struct {
 		V        int               `json:"v"`
 		Type     string            `json:"type"`
 		SeqStart uint64            `json:"seqStart"`
@@ -1901,16 +1922,31 @@ func (c *Client) runSession(ctx context.Context, bridge EventSource, tr frameTra
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
 
-	errCh := make(chan error, 5)
-	go func() { errCh <- c.writeLoop(sessCtx, tr.sendControl) }()
+	// errCh is sized to the exact number of reporting goroutines, and every
+	// send is non-blocking. The select below consumes only the FIRST error,
+	// so a later goroutine must never be able to park forever on a full
+	// buffer while the session is winding down.
+	reporters := 5 // writeLoop, writeReqLoop, readLoop(control), idleWatchdog
+	if tr.recvRequest != nil {
+		reporters++ // readLoop(request)
+	}
+	errCh := make(chan error, reporters)
+	report := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+			// A result is already queued; the session is ending.
+		}
+	}
+	go func() { report(c.writeLoop(sessCtx, tr.sendControl)) }()
 	// Request-plane loop always runs; over WS it multiplexes onto the same
 	// connection under the transport's write mutex.
-	go func() { errCh <- c.writeReqLoop(sessCtx, tr.sendRequest) }()
-	go func() { errCh <- c.readLoop(sessCtx, tr.recvControl, bridge) }()
+	go func() { report(c.writeReqLoop(sessCtx, tr.sendRequest)) }()
+	go func() { report(c.readLoop(sessCtx, tr.recvControl, bridge)) }()
 	if tr.recvRequest != nil {
-		go func() { errCh <- c.readLoop(sessCtx, tr.recvRequest, bridge) }()
+		go func() { report(c.readLoop(sessCtx, tr.recvRequest, bridge)) }()
 	}
-	go func() { errCh <- c.idleWatchdog(sessCtx) }()
+	go func() { report(c.idleWatchdog(sessCtx)) }()
 
 	select {
 	case <-ctx.Done():

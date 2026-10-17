@@ -8,12 +8,15 @@ require (
 )
 
 require (
+	github.com/goccy/go-json v0.11.2 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
 
-require github.com/AgentsHarness/capri-transport v0.0.0
+require (
+	github.com/AgentsHarness/capri-transport v0.0.0
+	github.com/klauspost/compress v1.20.3
+)
 
 replace github.com/AgentsHarness/capri-transport => ../capri-transport
-
