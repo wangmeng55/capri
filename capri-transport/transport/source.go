@@ -1,17 +1,7 @@
 package transport
 
-// Neutral, agent-agnostic types for the shared relay client.
-//
-// The shared transport module must not depend on any concrete agent (Grok's
-// internal/acp, opencode, …). Everything the client needs from its host is
-// expressed here as an EventSource adapter that each host implements:
-//
-//   - capri-host adapts *acp.Bridge (internal/hubadapt.ACPBridge);
-//   - opencode-host adapts its own supervisor/event fan-out.
-//
-// The Grok event envelope is a JSON object, so Event is an alias of
-// map[string]any: existing acp.Event values (also map[string]any) flow into
-// the shared client with no conversion and no behavior change.
+// Neutral event types retained for the legacy host event relay and its
+// benchmarks. The OpenCode host uses the transparent HTTP tunnel instead.
 
 // Event is one uplink event envelope. It is an alias (not a defined type) so a
 // host's own event map type is directly assignable.

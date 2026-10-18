@@ -1979,7 +1979,7 @@ func waitFor(t *testing.T, cond func() bool, d time.Duration) {
 
 // TestCriticalEventTypesCoverFETurnTerminals: the hub's never-drop set must
 // match what the FE treats as a turn terminal / pending transition
-// (capri-fe store/chat/turnLifecycle.ts TURN_TERMINAL_TYPES + turnEnd.ts).
+// (the browser turn lifecycle and terminal event handling).
 // A gap here is silent: a dropped "cancelled"/"prompt_complete" leaves the
 // composer on "Responding…" forever, and a dropped session "error" hides
 // the failure, because no later event of that turn can reveal the hole.

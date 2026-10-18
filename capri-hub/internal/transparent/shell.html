@@ -64,7 +64,7 @@
 
   <script>
     "use strict";
-    var state = { csrf: "", hosts: [], accessToken: sessionStorage.getItem("capri-fe-token") || "" };
+    var state = { csrf: "", hosts: [], accessToken: sessionStorage.getItem("capri-token") || "" };
 
     function $(id) { return document.getElementById(id); }
     function show(el, on) { el.hidden = !on; }
@@ -101,7 +101,7 @@
       if (!state.accessToken) { show($("login"), true); return; }
       var s = await api("/api/auth/session");
       if (s.ok && s.data) { state.csrf = s.data.csrf || ""; enterApp(); }
-      else { state.accessToken = ""; sessionStorage.removeItem("capri-fe-token"); show($("login"), true); }
+      else { state.accessToken = ""; sessionStorage.removeItem("capri-token"); show($("login"), true); }
     }
 
     function enterApp() {
@@ -117,7 +117,7 @@
       var r = await api("/api/auth/login", { method: "POST", body: JSON.stringify({ token: token }) });
       if (!r.ok) { $("loginErr").textContent = (r.data && r.data.error) || ("login failed (" + r.status + ")"); return; }
       state.accessToken = token;
-      sessionStorage.setItem("capri-fe-token", token);
+      sessionStorage.setItem("capri-token", token);
       $("token").value = "";
       state.csrf = (r.data && r.data.csrf) || "";
       state.hosts = [];
@@ -126,7 +126,7 @@
 
     $("logout").addEventListener("click", async function () {
       await api("/api/auth/logout", { method: "POST" });
-      state.accessToken = ""; sessionStorage.removeItem("capri-fe-token");
+      state.accessToken = ""; sessionStorage.removeItem("capri-token");
       state.csrf = ""; state.hosts = [];
       $("frame").hidden = true; $("frame").src = "about:blank";
       show($("viewHint"), true);
@@ -146,7 +146,7 @@
       if (!state.hosts.length) { box.innerHTML = '<div class="empty">No hosts paired yet.</div>'; return; }
       box.innerHTML = "";
       state.hosts.forEach(function (h) {
-        var kind = h.kind || "grok";
+        var kind = h.kind || "opencode";
         var btn = document.createElement("button");
         btn.className = "host";
         btn.setAttribute("role", "option");
@@ -166,15 +166,7 @@
     async function selectHost(h, btn) {
       Array.prototype.forEach.call(document.querySelectorAll(".host"), function (b) { b.setAttribute("aria-selected", "false"); });
       if (btn) btn.setAttribute("aria-selected", "true");
-      var kind = h.kind || "grok";
-      if (kind !== "opencode") {
-        $("frame").hidden = true;
-        show($("viewHint"), true);
-        $("viewHint").innerHTML = 'Grok host <b>' + escapeHtml(h.hostName || h.hostId) + '</b> uses the existing capri view. ' +
-          'Open the capri frontend for this host (grok view adapter is a separate deliverable).';
-        return;
-      }
-      // opencode: redeem a one-time view ticket into a host-only cookie, then
+      // Redeem a one-time view ticket into a host-only cookie, then
       // load the official frontend in the iframe at its own origin.
       var t = await api("/api/hosts/" + encodeURIComponent(h.hostId) + "/view-ticket", { method: "POST" });
       if (!t.ok || !t.data || !t.data.ticket || !t.data.origin) {

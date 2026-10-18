@@ -10,6 +10,14 @@ $goEnvScript = Join-Path $PSScriptRoot "goenv.ps1"
 $outputDir = Join-Path $repoRoot "dist"
 $binary = Join-Path $outputDir "capri-hub-linux-amd64"
 $remoteStage = "$RemoteBinary.new"
+$gitVersion = "unknown"
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $gitOutput = & git -C $repoRoot rev-parse --short HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $gitOutput) {
+        $gitVersion = ("$gitOutput").Trim()
+    }
+}
+$buildVersion = "$gitVersion-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 
 if (-not (Test-Path -LiteralPath $SshKey -PathType Leaf)) {
     throw "SSH key not found: $SshKey"
@@ -44,7 +52,7 @@ try {
     Push-Location $repoRoot
     try {
         Write-Host "Building Capri hub for Linux amd64..."
-        & go build -o $binary ./capri-hub/cmd/capri-hub
+        & go build -ldflags "-X main.version=$buildVersion" -o $binary ./capri-hub/cmd/capri-hub
         if ($LASTEXITCODE -ne 0) { throw "Go build failed with exit code $LASTEXITCODE" }
     }
     finally {
@@ -87,4 +95,5 @@ Write-Host "Installing and restarting Capri hub..."
 & ssh @sshArgs $Vps $remoteCommand
 if ($LASTEXITCODE -ne 0) { throw "Remote install failed with exit code $LASTEXITCODE" }
 
-Write-Host "Deployment complete. Refresh the Capri page if you changed the hub UI."
+Write-Host "Deployment complete. Hub version: $buildVersion"
+Write-Host "Refresh the Capri page if you changed the hub UI."

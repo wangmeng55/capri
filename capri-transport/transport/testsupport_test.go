@@ -2,8 +2,7 @@ package transport
 
 import "sync"
 
-// fakeSource is a minimal EventSource test double, standing in for
-// *acp.Bridge now that the shared client no longer imports any concrete agent.
+// fakeSource is a minimal EventSource test double for the shared client.
 //
 // Subscribe returns a buffered channel registered as a subscriber; Broadcast
 // delivers to every current subscriber (like the real Bridge's fan-out). The

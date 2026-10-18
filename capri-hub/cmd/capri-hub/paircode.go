@@ -6,18 +6,11 @@ package main
 // Why a subcommand rather than a doc note telling operators to read the
 // log: the pairing code lives only in the running hub's memory and
 // rotates every PairingCodeTTL, so there is no file to cat and the
-// startup log line goes stale within 15 minutes. In a container nobody
-// has a terminal attached to the process, and GET /api/pairing sits
-// behind FE_TOKEN in production.
-//
-// Running this command INSIDE the container solves both halves: it dials
-// 127.0.0.1 (so the endpoint need not be exposed publicly) and picks up
-// the very FE_TOKEN the hub process was started with (so the operator
-// never handles the secret):
-//
-//	docker compose exec capri-hub capri-hub paircode
-//
-// It also works from anywhere else with -url and -token.
+// startup log line goes stale within 15 minutes. GET /api/pairing sits
+// behind FE_TOKEN in production. Run this command on the Hub server with
+// the same PORT and FE_TOKEN environment values as the service; it dials
+// loopback so the pairing endpoint need not be exposed publicly. Remote use
+// is also possible with -url and -token.
 
 import (
 	"context"
@@ -86,8 +79,8 @@ func fetchPairCode(ctx context.Context, client *http.Client, baseURL, token stri
 	return out, nil
 }
 
-// defaultPairCodeURL points at the loopback address of a hub in this same
-// container / machine, honouring PORT so an overridden port still works.
+// defaultPairCodeURL points at the loopback address of the local hub,
+// honouring PORT so an overridden port still works.
 func defaultPairCodeURL() string {
 	port := 8787
 	if v := strings.TrimSpace(os.Getenv("PORT")); v != "" {
@@ -125,10 +118,8 @@ func runPairCode(args []string, stdout, stderr io.Writer) int {
 
 打印当前配对码（Host 端配对时输入的 6 位码）。
 
-在容器里运行时不需要任何参数 —— 它连 127.0.0.1 并复用 hub 进程自己的
-FE_TOKEN:
-
-  docker compose exec capri-hub capri-hub paircode
+在 Hub 服务器上、加载服务使用的 FE_TOKEN 和 PORT 环境变量后运行时，
+不需要任何参数：它连接 127.0.0.1 并读取本地 FE_TOKEN。
 
 选项:
 `)
@@ -164,8 +155,8 @@ FE_TOKEN:
 		switch {
 		case errors.Is(err, errPairCodeUnauthorized):
 			fmt.Fprintf(stderr, "hub 拒绝了请求: FE_TOKEN 不匹配。\n"+
-				"容器内请直接运行 `capri-hub paircode`（会复用 hub 自己的 FE_TOKEN）；\n"+
-				"容器外请设置 FE_TOKEN 环境变量（不要用 -token：参数会留在\n"+
+				"请在 Hub 服务器上加载服务使用的 FE_TOKEN 后运行 `capri-hub paircode`；\n"+
+				"避免使用 -token：参数会留在\n"+
 				"进程命令行里，同机其他用户 ps 可见）。\n")
 		case errors.Is(err, context.DeadlineExceeded):
 			fmt.Fprintf(stderr, "连接 %s 超时。hub 起来了吗？端口/反代对吗？\n", *url)

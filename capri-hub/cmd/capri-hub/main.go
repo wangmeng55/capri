@@ -1,6 +1,6 @@
 // capri-hub: 中心化中转服务器（relay）。
 //
-//		Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──QUIC/WS /ws/host──▶ capri-host × N ──stdio──▶ grok
+//		Browser ──HTTPS──▶ capri-hub ──transparent tunnel──▶ opencode-host × N ──▶ opencode serve
 //
 //	  - 配对：Host 用配对码换取 token（POST /api/pair），token 持久化在 ~/.capri-hub。
 //	  - Host 出站连接（GET /ws/host 或 QUIC UDP）：下行 request/subscribers，上行 events/respond。
@@ -93,7 +93,7 @@ func main() {
 	log.Printf("[capri-hub] pairing code: %s (expires %s)", code, exp.Format("15:04:05"))
 	// The line above is stale within PairingCodeTTL, so point at the
 	// command that always prints the live one — this log is often the
-	// only thing an operator of a container ever reads.
+	// only thing an operator may have available in the service log.
 	log.Printf("[capri-hub] 配对码 %d 分钟后自动轮换；随时查看当前码: capri-hub paircode",
 		int(hub.PairingCodeTTL/time.Minute))
 	if feToken != "" {

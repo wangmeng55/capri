@@ -1,6 +1,7 @@
 # Local toolchain and workspace-only material
 /tools/*
 !/tools/deploy-hub.ps1
+!/tools/deploy-opencode-host.ps1
 /分析/
 
 # Local Go caches and workspaces

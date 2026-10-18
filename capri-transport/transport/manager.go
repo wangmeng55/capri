@@ -175,7 +175,7 @@ func (m *Manager) HubURL() string {
 
 // Rename updates the host's display name everywhere it appears: the hub
 // registry (so browsers see the new name live), the running bridge (so the
-// local API and grok frames use it), and config.json (so it survives a
+// local API and relay frames use it), and config.json (so it survives a
 // restart). An empty or whitespace-only name is refused.
 //
 // The hub update runs through the live client when one is connected; in

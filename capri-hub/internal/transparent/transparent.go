@@ -3,8 +3,8 @@
 // browser session cookie, the one-time view ticket, and the /__capri/session
 // exchange (contracts C1 §2 and C2).
 //
-// It is additive: the legacy Grok browser entry (FE_TOKEN on /api/* and
-// /ws/fe) is untouched. Nothing here parses opencode business endpoints.
+// The gateway authenticates browser sessions and routes host-origin requests;
+// it does not parse OpenCode business endpoints.
 package transparent
 
 import (

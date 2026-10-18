@@ -1,11 +1,11 @@
-// Command opencode-host is the opencode-host binary of the capri multi-agent
-// platform. It supervises a local `opencode serve` child and exposes it to a
+// Command opencode-host is the OpenCode-specific Capri host process. It
+// supervises a local `opencode serve` child and exposes it to a
 // browser through the transparent plane. This build serves the LocalGateway
 // (direct, loopback-first) path; the hub-relayed path is wired by the hub data
 // connection (see docs).
 //
-// It mirrors capri-host's shape: a UI-free console binary that logs to stderr
-// and serves an HTTP API, so it can run under launchd/systemd/terminal/container.
+// It is a UI-free console binary that logs to stderr and serves an HTTP API,
+// so it can run under launchd/systemd/terminal/container.
 package main
 
 import (
@@ -31,8 +31,7 @@ func main() {
 	gwToken := os.Getenv("OCHOST_TOKEN")
 	bin := os.Getenv("OPENCODE_BIN")
 
-	// Fail-fast: a non-loopback listener must have a gate (C1 §5, mirroring
-	// capri-host's CheckBindPolicy). Loopback-only needs none.
+	// Fail-fast: a non-loopback listener must have a gate (C1 §5). Loopback-only needs none.
 	if !isLoopback(bind) && gwToken == "" {
 		log.Fatalf("[opencode-host] refusing to bind %s without OCHOST_TOKEN (set it or bind loopback)", bind)
 	}

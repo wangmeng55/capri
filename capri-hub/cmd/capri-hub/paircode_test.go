@@ -190,8 +190,8 @@ func TestRunPairCodePrintsCodeAndExpiry(t *testing.T) {
 }
 
 func TestRunPairCodeReadsTokenFromEnv(t *testing.T) {
-	// This is the container path: `capri-hub paircode` with no flags
-	// inherits the hub's own FE_TOKEN from the process environment.
+	// `capri-hub paircode` with no token flag reads FE_TOKEN from the
+	// process environment used by the service.
 	stub := &pairCodeStub{token: "from-env", code: "ENVOK1"}
 	srv := httptest.NewServer(stub.handler())
 	defer srv.Close()

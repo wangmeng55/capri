@@ -17,8 +17,8 @@ import (
 	transport "github.com/AgentsHarness/capri-transport/transport"
 )
 
-// makeEvents builds a deterministic batch of n events shaped like real
-// ACP session/update traffic (mixed types, nested params, ~200B each).
+// makeEvents builds a deterministic batch of n representative events with
+// mixed types, nested params, and payloads of roughly 200 bytes each.
 func makeEvents(n int) []transport.Event {
 	evs := make([]transport.Event, n)
 	for i := 0; i < n; i++ {

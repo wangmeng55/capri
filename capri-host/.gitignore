@@ -2,7 +2,6 @@
 .playwright-cli/
 
 # Binaries
-/capri-host
 /bin/
 /dist/
 /release/
@@ -24,4 +23,3 @@
 !.vscode/extensions.json
 .idea
 .DS_Store
-internal/server/web

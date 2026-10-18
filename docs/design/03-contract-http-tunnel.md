@@ -2,14 +2,14 @@
 
 ## 1. 兼容与连接建立
 
-本协议名 `http-tunnel-v1`。旧 auth/hello、request/respond、Grok events/seq/replay/压缩契约不改字段语义，新能力在连接鉴权后的 capability 协商中声明。双方都声明 http-tunnel-v1 才可接受透明请求；能力缺失返回 503，不回退为旧单帧 respond。
+本协议名 `http-tunnel-v1`。Hub 与 host 通过 capability 协商透明隧道；双方都声明 http-tunnel-v1 才可接受透明请求，能力缺失返回 503。
 
-hub 认证 hostId 和 kind 后生成新透明数据会话 connId；所有隧道帧都绑定该身份。connId 不是 Grok 的事件 seq，也不在重连后恢复。
+hub 认证 hostId 后生成透明数据会话 connId；所有隧道帧都绑定该身份。connId 不在重连后恢复。
 
 | 底层传输 | 新透明通道的承载 |
 |---|---|
 | QUIC | 双方显式协商后，由 hub 为每条透明请求开启独立双向 QUIC stream，首帧是 http-open/ws-open；响应在同一 stream 回传。连接控制流继续承载鉴权、心跳和优先取消。 |
-| WS 降级 | host 主动连接新的 WSS `/ws/host/tunnel` 数据连接；同一连接按 reqId 复用透明请求，不和旧 Grok events/respond 共用一个数据 writer。 |
+| WS 数据连接 | host 主动连接 WSS `/ws/host/tunnel`；同一连接按 reqId 复用透明请求。 |
 
 WS 数据连接通过控制会话中取得的一次性 tunnelTicket 建立，ticket 绑定已认证 hostId 与控制会话，默认 30 秒过期；原子消费后生成 connId 并回复 tunnel-ready。host 是原生程序，可使用 Authorization 头提交 ticket。控制会话消失时关闭附属数据连接。数据连接断开后可在仍有效控制会话上请求新 ticket，但必须生成新 connId 并失败结束旧隧道，不续传旧字节。
 
@@ -27,11 +27,11 @@ QUIC 透明独立 stream 和 WS 新数据连接是协议扩展，hub 与共享�
 | tunnel-control / ticket-issued | controlSessionId、ticket、expiresAt；敏感字段，不能日志输出 |
 | WSS数据入口的tunnel-ready | v=1、type=tunnel-control、op=tunnel-ready、controlSessionId、connId、tunnelVersion=1 |
 
-未知能力由旧hub忽略，新host只有读到明确的tunnel协商结果才启用透明请求。配额/窗口和帧上限按双方支持的较小值协商；http-open/ws-open不能用更大initialWindows覆盖已协商上限。kind和能力不改变旧Grok帧含义。
+未知能力由Hub忽略，host只有读到明确的tunnel协商结果才启用透明请求。配额/窗口和帧上限按双方支持的较小值协商；http-open/ws-open不能用更大initialWindows覆盖已协商上限。
 
 ## 2. 帧编码与公共字段
 
-首版沿用易于接入的 JSON envelope，二进制 body/升级字节用 base64。QUIC 用现有形式的 4 字节大端长度前缀包裹 JSON；新增帧遵循本协议更小的长度上限，不因此缩小旧 Grok 帧限额。WS 数据连接每个 text message 承载一帧 JSON。新增透明帧暂不复用旧 events/respond 的 deflate 协商；浏览器内层 WS 的压缩字节可以原样经过隧道。
+首版使用 JSON envelope，二进制 body/升级字节用 base64。QUIC 用 4 字节大端长度前缀包裹 JSON；WS 数据连接每个 text message 承载一帧 JSON。浏览器内层 WS 的压缩字节可以原样经过隧道。
 
 ```json
 {

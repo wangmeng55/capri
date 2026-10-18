@@ -1,10 +1,8 @@
 # host↔hub 上行压缩协议（deflate）
 
-状态：**双侧已实现并对齐**（capri-host `internal/hub/client.go`、acp-hub
-`cmd/capri-hub/main.go`）。本文件与 acp-hub `internal/hub/PROTOCOL.md` 保持一致。
-
-> 事件语义（seq 分配 / 双路去重 / 分级背压 / 断线恢复）的契约另见
-> [docs/EVENT-CONTRACTS.md](../../docs/EVENT-CONTRACTS.md)。
+状态：**双侧已实现并对齐**（`capri-host/internal/ochost/hubconn.go`、
+`capri-hub/cmd/capri-hub/main.go`）。本文件与
+[`capri-hub/internal/hub/PROTOCOL.md`](../../capri-hub/internal/hub/PROTOCOL.md) 保持一致。
 
 ## 1. 协商
 

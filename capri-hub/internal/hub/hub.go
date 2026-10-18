@@ -1,14 +1,5 @@
-// Package hub implements the capri-hub relay core: host pairing (pairing
-// code → token), the host registry, event fan-out to browsers, and the
-// browser ↔ host request relay.
-//
-// Transport model (WebSocket + HTTP API):
-//
-//	Browser (capri-fe) ──WS /ws/fe + HTTP /api/*──▶ capri-hub ──WS /ws/host──▶ capri-host × N ──stdio──▶ grok
-//
-// Hosts connect OUTBOUND to the hub (NAT-friendly): one WebSocket carries
-// relayed browser requests down and host events / responds up. Browsers
-// open /ws/fe for the aggregated live event stream; REST APIs stay on HTTP.
+// Package hub implements Hub pairing, host registry, and relay state.
+// OpenCode browser requests use the transparent host-origin tunnel.
 package hub
 
 import (
@@ -67,13 +58,6 @@ const (
 	maxHostIDLen   = 128
 	maxHostNameLen = 256
 )
-
-func inferHostKind(hostID string) string {
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(hostID)), "opencode-") {
-		return "opencode"
-	}
-	return "grok"
-}
 
 // EventBufGrace is how long after a host disconnect we keep its gap-pull
 // buffer so a short blip can still be filled via GET /api/events. Zero
@@ -351,10 +335,8 @@ func NewWithDir(dir string) *Hub {
 
 // defaultDataDir resolves where hub.json / prefs.json live.
 //
-// HUB_DATA_DIR wins when set: a container has no meaningful home
-// directory, and relying on $HOME to redirect state is fragile (it also
-// moves anything else that reads the home dir). An explicit override
-// lets the deployment mount one volume at one known path.
+// HUB_DATA_DIR wins when set, so deployments can keep Hub state at a
+// stable location independent of the service account's home directory.
 func defaultDataDir() string {
 	if dir := strings.TrimSpace(os.Getenv("HUB_DATA_DIR")); dir != "" {
 		return dir
@@ -406,7 +388,7 @@ func (h *Hub) load() {
 		}
 		kind := strings.ToLower(strings.TrimSpace(ph.Kind))
 		if kind == "" {
-			kind = inferHostKind(id)
+			kind = "opencode"
 		}
 		h.hosts[id] = &hostState{
 			info: HostInfo{HostID: id, HostName: ph.HostName, Kind: kind, Ready: ph.Ready, Port: ph.Port},
@@ -426,8 +408,8 @@ func (h *Hub) load() {
 		} else {
 			// Orphan token without a hosts entry — synthesize a minimal host
 			// so the token remains usable and re-pair can still revoke it.
-				h.hosts[hid] = &hostState{
-				info:  HostInfo{HostID: hid, Kind: inferHostKind(hid)},
+			h.hosts[hid] = &hostState{
+				info:  HostInfo{HostID: hid, Kind: "opencode"},
 				token: tok,
 			}
 		}
@@ -749,9 +731,8 @@ func (h *Hub) Pair(code, hostID, hostName string, port ...int) (string, error) {
 	return h.PairWithKind(code, hostID, hostName, "", port...)
 }
 
-// PairWithKind is Pair with an explicit host adapter kind. Older clients may
-// omit kind; the host ID prefix is used to recognize opencode hosts, with Grok
-// remaining the default for existing clients.
+// PairWithKind is Pair with the OpenCode host kind. The empty value is accepted
+// for older OpenCode hosts and normalized to "opencode".
 func (h *Hub) PairWithKind(code, hostID, hostName, kind string, port ...int) (string, error) {
 	listenPort := 0
 	if len(port) > 0 {
@@ -783,11 +764,11 @@ func (h *Hub) PairWithKind(code, hostID, hostName, kind string, port ...int) (st
 	}
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	if kind == "" {
-		kind = inferHostKind(hostID)
+		kind = "opencode"
 	}
-	if kind != "grok" && kind != "opencode" {
+	if kind != "opencode" {
 		h.mu.Unlock()
-		return "", errors.New("kind 必须是 grok 或 opencode")
+		return "", errors.New("kind 必须是 opencode")
 	}
 	if len(hostName) > maxHostNameLen {
 		h.mu.Unlock()
@@ -1854,7 +1835,7 @@ func (s *feSubscriber) watches(evHost string) bool {
 // (hostId,seq) gap-pull repairs them.
 //
 // The set MUST cover every event the FE treats as a turn terminal or a
-// pending-interaction transition (see capri-fe store/chat/turnLifecycle.ts
+// pending-interaction transition (see the frontend turn lifecycle
 // TURN_TERMINAL_TYPES + events/turnEnd.ts): dropping "cancelled" /
 // "prompt_complete" leaves the composer stuck on "Responding…" with no
 // later event to reveal the gap, and a dropped session-scoped "error"

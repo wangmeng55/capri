@@ -24,7 +24,6 @@ hub 在成功认证 host 后持有：
 | 字段 | 含义 |
 |---|---|
 | hostId | 稳定、不可被显示名称替代的主机身份 |
-| kind | grok / opencode |
 | originLabel | hub 分配的稳定 DNS label，例如 h-a1 |
 | origin | 由部署域名配置和 originLabel 构造的 HTTPS origin |
 | online / ready | 隧道是否在线、本机后端是否就绪 |
@@ -51,7 +50,6 @@ hostOrigin 上除了保留的 `/__capri/` 网关路径，其他路径都透明�
 
 hub 为 iframe 响应设置/核对 `Content-Security-Policy: frame-ancestors https://console.example.com`；若上游 CSP/X-Frame-Options 禁止这种嵌入，视为兼容性阻塞，先研究官方支持的承载方式，不盲目删除策略。外壳自身的 frame-src 仅允许已配置 host 子域。首版不以 `sandbox` 的 opaque origin 模式加载官方应用。
 
-Grok 视图走现有 capri 前端与旧中继适配器，保持现有 API/事件契约；只有外壳选择层认识 kind。具体 Grok 前端入口需从 capri-fe/capri-hub 源码核对，不能为了统一 iframe 拓扑把旧 Grok 请求改成透明隧道。
 
 ## 4. HTTP 元数据的代理规则
 

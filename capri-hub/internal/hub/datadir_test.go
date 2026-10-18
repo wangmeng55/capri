@@ -6,11 +6,8 @@ import (
 	"testing"
 )
 
-// HUB_DATA_DIR is what lets a container keep pairing state on a mounted
-// volume. If it silently fell back to the home directory the state would
-// land inside the container's writable layer and every `docker compose
-// up --force-recreate` would drop every paired host — a failure that
-// looks like "the hub forgot my hosts" rather than a config mistake.
+// HUB_DATA_DIR lets a deployment keep pairing state at an explicit
+// persistent location instead of the service account's home directory.
 func TestDefaultDataDirHubDataDirOverride(t *testing.T) {
 	want := filepath.Join(t.TempDir(), "data")
 	t.Setenv("HUB_DATA_DIR", want)
