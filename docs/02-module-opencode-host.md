@@ -1,6 +1,6 @@
 # opencode-host · 本机服务、代理与监管设计
 
-> 设计修订稿。依赖[C1](../03-contracts/origin-routing.md)、[C2](../03-contracts/browser-auth.md)、[C4](../03-contracts/stream-lifecycle.md)。尚未实现。
+> 设计修订稿。依赖[C1](03-contract-origin-routing.md)、[C2](03-contract-browser-auth.md)、[C4](03-contract-stream-lifecycle.md)。尚未实现。
 
 ## 1. 责任与目录计划
 

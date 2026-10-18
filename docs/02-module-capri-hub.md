@@ -1,6 +1,6 @@
 # capri-hub · 公网入口、认证与隧道桥接设计
 
-> 设计修订稿；具体契约见[C1](../03-contracts/origin-routing.md)、[C2](../03-contracts/browser-auth.md)、[C3](../03-contracts/http-tunnel.md)、[C4](../03-contracts/stream-lifecycle.md)。对应hub源码尚待取得/核对。
+> 设计修订稿；具体契约见[C1](03-contract-origin-routing.md)、[C2](03-contract-browser-auth.md)、[C3](03-contract-http-tunnel.md)、[C4](03-contract-stream-lifecycle.md)。对应hub源码尚待取得/核对。
 
 ## 1. 部署与责任
 

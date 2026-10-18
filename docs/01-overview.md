@@ -1,7 +1,7 @@
 # capri 多 agent 平台 · opencode 远程接入 - 总体架构设计
 
 > 2026-10-14 设计修订稿。当前仅设计，未实现、未完成端到端验收。
-> 来源需求：[requirements.md](../../../requirement-agent/features/opencode-remote/requirements.md)（原文路径见文末）。
+> 来源需求：[requirements.md](requirements.md)（原文路径见文末）。
 > 原M0记录的opencode版本为1.18.25；HTTP/SSE/PTY WS/Basic等记录是本机能力探测，不代表手机/公网/iframe链路已通过。
 
 ## 1. 目标与既定方向
@@ -58,12 +58,12 @@ flowchart TB
 
 | 文档 | 具体决定 |
 |---|---|
-| [C1 Origin与路由](03-contracts/origin-routing.md) | console与每host HTTPS子域都指向hub；opencode视图iframe内API同源；固定loopback目标 |
-| [C2 浏览器认证](03-contracts/browser-auth.md) | FE_TOKEN换父会话；一次性POST票据换host-only视图Cookie；认证覆盖HTTP/SSE/WS |
-| [C3 HTTP隧道](03-contracts/http-tunnel.md) | 新能力协商；请求头/体、响应头/体、结束/取消/窗口；WS握手透传后原始字节流 |
-| [C4 流生命周期](03-contracts/stream-lifecycle.md) | 有界缓冲、独立方向窗口、无payload丢帧、取消传播、断线不重放、Supervisor清理 |
+| [C1 Origin与路由](03-contract-origin-routing.md) | console与每host HTTPS子域都指向hub；opencode视图iframe内API同源；固定loopback目标 |
+| [C2 浏览器认证](03-contract-browser-auth.md) | FE_TOKEN换父会话；一次性POST票据换host-only视图Cookie；认证覆盖HTTP/SSE/WS |
+| [C3 HTTP隧道](03-contract-http-tunnel.md) | 新能力协商；请求头/体、响应头/体、结束/取消/窗口；WS握手透传后原始字节流 |
+| [C4 流生命周期](03-contract-stream-lifecycle.md) | 有界缓冲、独立方向窗口、无payload丢帧、取消传播、断线不重放、Supervisor清理 |
 | [完整交互链路](04-interactions.md) | 配对、登录、iframe加载、API、prompt/SSE、审批、终端、取消、重连、切换与直连 |
-| [契约索引与前置检查](03-contracts/README.md) | 权威关系、设计状态与尚未验证的兼容性 |
+| [契约索引与前置检查](03-contracts-index.md) | 权威关系、设计状态与尚未验证的兼容性 |
 
 以上具体技术选择是本轮设计方案，用户已要求补齐契约；不标记为已逐项确认或已实测。规范链接在对应契约内。
 
@@ -96,10 +96,10 @@ shell新增登录/session/logout、已认证host列表、view-ticket API。hostO
 
 | 设计 | 责任 |
 |---|---|
-| [shared-transport](02-modules/shared-transport.md) | 中立连接协议、请求复用、帧、窗口与资源清理 |
-| [opencode-host](02-modules/opencode-host.md) | Supervisor、LocalProxy、认证注入、官方视图、本机直连 |
-| [capri-shell](02-modules/capri-shell.md) | HostRegistry、浏览器认证、异步ViewRouter、视图卸载 |
-| [capri-hub](02-modules/capri-hub.md) | 域名与host绑定、认证/票据、Browser请求到隧道的桥接 |
+| [shared-transport](02-module-shared-transport.md) | 中立连接协议、请求复用、帧、窗口与资源清理 |
+| [opencode-host](02-module-opencode-host.md) | Supervisor、LocalProxy、认证注入、官方视图、本机直连 |
+| [capri-shell](02-module-capri-shell.md) | HostRegistry、浏览器认证、异步ViewRouter、视图卸载 |
+| [capri-hub](02-module-capri-hub.md) | 域名与host绑定、认证/票据、Browser请求到隧道的桥接 |
 
 共享库若独立Go module，公共包放module根下公开目录transport/hubstate/netinfo/procattr，供其他repo导入；不能把独立共享API仍放在capri-host/internal下并期待外部module直接import。opencode-host首版仍计划放capri-host repo的cmd/opencode-host和internal/ochost，以实现双二进制；Grok适配器留在该repo。实际module名称、发布位置和本地workspace连接在编码前确定，不擅自使用用户尚未拥有的远程repo名。
 
@@ -138,6 +138,6 @@ shell新增登录/session/logout、已认证host列表、view-ticket API。hostO
 
 ## 10. 依据与状态
 
-需求文件：`docs/agents/requirement-agent/features/opencode-remote/requirements.md`；M0原始记录：[分析文档](../../../../../分析/opencode远程控制-需求分析文档.md)。既有代码行号是原快照分析线索，随源码变化不能当作永久位置。
+需求文件：`docs/requirements.md`；M0原始记录：[分析文档](../分析/opencode远程控制-需求分析文档.md)。既有代码行号是原快照分析线索，随源码变化不能当作永久位置。
 
-本轮只编辑Markdown设计文档，未编写/修改实现、启动服务或执行软件测试。设计状态与新技术选择记录在[state.md](state.md)及[decisions.md](decisions.md)。
+本轮只编辑Markdown设计文档，未编写/修改实现、启动服务或执行软件测试。设计状态与新技术选择记录在[state.md](state-design.md)及[decisions.md](decisions-design.md)。

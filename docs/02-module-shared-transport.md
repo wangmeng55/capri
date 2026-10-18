@@ -1,6 +1,6 @@
 # shared-transport · 连接、透明通道与流控设计
 
-> 设计修订稿，具体wire格式以[C3](../03-contracts/http-tunnel.md)、生命周期以[C4](../03-contracts/stream-lifecycle.md)为准。尚未实现。
+> 设计修订稿，具体wire格式以[C3](03-contract-http-tunnel.md)、生命周期以[C4](03-contract-stream-lifecycle.md)为准。尚未实现。
 
 ## 1. 职责与抽取边界
 

@@ -15,13 +15,13 @@
 | 产物 | 内容 |
 |---|---|
 | [总体设计](01-overview.md) | hub部署、职责与数据边界、实施阶段、风险及修订后的模块分工 |
-| [契约目录](03-contracts/README.md) | C1–C4索引、设计权威关系、版本与兼容性前置检查 |
-| [C1](03-contracts/origin-routing.md) | 多host子域到同一hub、官方iframe、HTTP头规则与直连 |
-| [C2](03-contracts/browser-auth.md) | shell/view会话、一次性票据、HTTP/SSE/WS认证与来源检查 |
-| [C3](03-contracts/http-tunnel.md) | 能力协商、独立数据通道、帧序列、升级字节和窗口 |
-| [C4](03-contracts/stream-lifecycle.md) | 取消、背压、预算、期限、重连与Supervisor |
+| [契约目录](03-contracts-index.md) | C1–C4索引、设计权威关系、版本与兼容性前置检查 |
+| [C1](03-contract-origin-routing.md) | 多host子域到同一hub、官方iframe、HTTP头规则与直连 |
+| [C2](03-contract-browser-auth.md) | shell/view会话、一次性票据、HTTP/SSE/WS认证与来源检查 |
+| [C3](03-contract-http-tunnel.md) | 能力协商、独立数据通道、帧序列、升级字节和窗口 |
+| [C4](03-contract-stream-lifecycle.md) | 取消、背压、预算、期限、重连与Supervisor |
 | [时序图](04-interactions.md) | 12个部署/交互场景及未来实施顺序 |
-| [模块设计](02-modules/capri-hub.md) | 已同步shared-transport/opencode-host/shell，并补充hub设计 |
+| [模块设计](02-module-capri-hub.md) | 已同步shared-transport/opencode-host/shell，并补充hub设计 |
 
 ## 当前方案与尚未验证项
 

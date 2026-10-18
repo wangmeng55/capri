@@ -1,6 +1,6 @@
 # capri-shell · 浏览器外壳与视图路由设计
 
-> 设计修订稿。采用[C1](../03-contracts/origin-routing.md)与[C2](../03-contracts/browser-auth.md)，完整流程见[交互时序图](../04-interactions.md)。
+> 设计修订稿。采用[C1](03-contract-origin-routing.md)与[C2](03-contract-browser-auth.md)，完整流程见[交互时序图](04-interactions.md)。
 
 ## 1. 承载与职责
 

@@ -6,12 +6,12 @@
 
 | 契约 | 回答的问题 | 文件 |
 |---|---|---|
-| C1 Origin 与 hub 路由 | 域名如何找到 host，前端由谁提供 | [origin-routing.md](origin-routing.md) |
-| C2 浏览器认证 | 登录如何覆盖普通 HTTP、SSE、WS 和 iframe | [browser-auth.md](browser-auth.md) |
-| C3 HTTP 隧道协议 | 请求、响应头、字节块、Upgrade 如何过长连接 | [http-tunnel.md](http-tunnel.md) |
-| C4 生命周期与流控 | 取消、背压、超时、断线和重放如何处理 | [stream-lifecycle.md](stream-lifecycle.md) |
+| C1 Origin 与 hub 路由 | 域名如何找到 host，前端由谁提供 | [origin-routing.md](03-contract-origin-routing.md) |
+| C2 浏览器认证 | 登录如何覆盖普通 HTTP、SSE、WS 和 iframe | [browser-auth.md](03-contract-browser-auth.md) |
+| C3 HTTP 隧道协议 | 请求、响应头、字节块、Upgrade 如何过长连接 | [http-tunnel.md](03-contract-http-tunnel.md) |
+| C4 生命周期与流控 | 取消、背压、超时、断线和重放如何处理 | [stream-lifecycle.md](03-contract-stream-lifecycle.md) |
 
-详细时序图是设计文档的一部分，集中在 [交互链路](../04-interactions.md)，总体设计通过链接引用，避免维护两份不同流程。
+详细时序图是设计文档的一部分，集中在 [交互链路](04-interactions.md)，总体设计通过链接引用，避免维护两份不同流程。
 
 ## 术语
 
