@@ -7,7 +7,7 @@ Capri is a self-hosted remote access system for OpenCode. It connects a browser-
 - `capri-transport/` — shared transport and relay packages.
 - `capri-host/` — host-side commands, including `opencode-host`.
 - `capri-hub/` — public hub service and web-facing APIs.
-- `docs/` — project design and implementation notes.
+- `docs/require/` — requirements, decisions, state.`n- `docs/design/` — architecture, contracts, interactions, deployment.
 
 The `capri-fe` frontend is maintained separately and is not part of this repository.
 
