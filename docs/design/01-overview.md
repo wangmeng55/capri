@@ -1,7 +1,7 @@
 # capri 多 agent 平台 · opencode 远程接入 - 总体架构设计
 
 > 2026-10-14 设计修订稿。当前仅设计，未实现、未完成端到端验收。
-> 来源需求：[requirements.md](requirements.md)（原文路径见文末）。
+> 来源需求：[requirements.md](../require/requirements.md)（原文路径见文末）。
 > 原M0记录的opencode版本为1.18.25；HTTP/SSE/PTY WS/Basic等记录是本机能力探测，不代表手机/公网/iframe链路已通过。
 
 ## 1. 目标与既定方向
@@ -138,6 +138,6 @@ shell新增登录/session/logout、已认证host列表、view-ticket API。hostO
 
 ## 10. 依据与状态
 
-需求文件：`docs/requirements.md`；M0原始记录：[分析文档](../分析/opencode远程控制-需求分析文档.md)。既有代码行号是原快照分析线索，随源码变化不能当作永久位置。
+需求文件：`docs/require/requirements.md`；M0原始记录：[分析文档](../../分析/opencode远程控制-需求分析文档.md)。既有代码行号是原快照分析线索，随源码变化不能当作永久位置。
 
-本轮只编辑Markdown设计文档，未编写/修改实现、启动服务或执行软件测试。设计状态与新技术选择记录在[state.md](state-design.md)及[decisions.md](decisions-design.md)。
+本轮只编辑Markdown设计文档，未编写/修改实现、启动服务或执行软件测试。设计状态与新技术选择记录在[state.md](state.md)及[decisions.md](decisions.md)。
