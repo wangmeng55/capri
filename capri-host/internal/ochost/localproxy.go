@@ -1,6 +1,7 @@
 package ochost
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/base64"
@@ -12,9 +13,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/AgentsHarness/capri-transport/transport"
 )
 
 var hashedAssetName = regexp.MustCompile(`-[A-Za-z0-9_-]{8,}\.`)
+
+const (
+	frontendHealthIntervalSource = "const R1e=1e4;"
+	frontendHealthIntervalTarget = "const R1e=6e4;"
+	frontendHealthCacheKey       = "capri-health-interval=60s"
+)
+
+var frontendMainBundleScript = regexp.MustCompile(`(<script[^>]+src=")(/assets/index-[^"]+\.js)(")`)
 
 // LocalProxy forwards transparent requests to a fixed loopback opencode server,
 // injecting the host-local Basic credential. It implements
@@ -85,6 +96,17 @@ func (p *LocalProxy) ForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	if transport.HasTunnelTraceObserver(r.Context()) {
+		observed := &observedResponseBody{ReadCloser: resp.Body, ctx: r.Context(), status: resp.StatusCode}
+		resp.Body = observed
+		defer func() {
+			transport.ObserveTunnelTrace(r.Context(), transport.TunnelTraceEvent{
+				Stage: "upstream_body_read_total", Status: resp.StatusCode,
+				Duration: observed.readDuration, Bytes: observed.bytes,
+			})
+		}()
+	}
+	rewriteFrontendHealthInterval(r, resp)
 	copyResponseHeaders(w.Header(), resp.Header)
 	if isHashedFrontendAsset(r.URL.Path) {
 		// OpenCode's frontend uses content-hashed asset names, so these files
@@ -111,6 +133,96 @@ func (p *LocalProxy) ForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// rewriteFrontendHealthInterval slows the OpenCode web app's background server
+// health polling from 10s to 60s. OpenCode ships this interval in its bundled
+// JavaScript, so keep the rewrite narrowly tied to the known bundle marker and
+// add a query string to the script URL to avoid stale immutable browser caches.
+func rewriteFrontendHealthInterval(req *http.Request, resp *http.Response) {
+	if req.Method != http.MethodGet || resp.StatusCode != http.StatusOK {
+		return
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "text/html") {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			resp.ContentLength = int64(len(body))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+			return
+		}
+		match := frontendMainBundleScript.FindSubmatchIndex(body)
+		if match == nil || bytes.Contains(body[match[4]:match[5]], []byte(frontendHealthCacheKey)) {
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			resp.ContentLength = int64(len(body))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+			return
+		}
+		assetURL := body[match[4]:match[5]]
+		cacheBustedURL := append(append([]byte(nil), assetURL...), '?')
+		cacheBustedURL = append(cacheBustedURL, frontendHealthCacheKey...)
+		updated := make([]byte, 0, len(body)+len(frontendHealthCacheKey)+1)
+		updated = append(updated, body[:match[4]]...)
+		updated = append(updated, cacheBustedURL...)
+		updated = append(updated, body[match[5]:]...)
+		resp.Body = io.NopCloser(bytes.NewReader(updated))
+		resp.ContentLength = int64(len(updated))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(updated)))
+		resp.Header.Set("Cache-Control", "no-cache")
+		resp.Header.Del("ETag")
+		resp.Header.Del("Content-MD5")
+		return
+	}
+	if !strings.Contains(contentType, "javascript") ||
+		!strings.HasPrefix(req.URL.Path, "/assets/index-") ||
+		!strings.HasSuffix(req.URL.Path, ".js") {
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return
+	}
+	if bytes.Count(body, []byte(frontendHealthIntervalSource)) != 1 {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return
+	}
+	updated := bytes.Replace(body, []byte(frontendHealthIntervalSource), []byte(frontendHealthIntervalTarget), 1)
+	resp.Body = io.NopCloser(bytes.NewReader(updated))
+	resp.ContentLength = int64(len(updated))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(updated)))
+	resp.Header.Del("ETag")
+	resp.Header.Del("Content-MD5")
+}
+
+// observedResponseBody measures time spent blocked in OpenCode body reads. The
+// elapsed read time excludes time spent compressing or writing tunnel frames.
+type observedResponseBody struct {
+	io.ReadCloser
+	ctx          context.Context
+	status       int
+	readDuration time.Duration
+	bytes        int64
+	firstByte    bool
+}
+
+func (b *observedResponseBody) Read(p []byte) (int, error) {
+	started := time.Now()
+	n, err := b.ReadCloser.Read(p)
+	b.readDuration += time.Since(started)
+	b.bytes += int64(n)
+	if n > 0 && !b.firstByte {
+		b.firstByte = true
+		transport.ObserveTunnelTrace(b.ctx, transport.TunnelTraceEvent{
+			Stage: "upstream_first_body_byte", Status: b.status, Bytes: int64(n),
+		})
+	}
+	return n, err
 }
 
 func isHashedFrontendAsset(requestPath string) bool {

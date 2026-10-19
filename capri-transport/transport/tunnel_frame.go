@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 )
 
 // http-tunnel-v1 wire protocol (contract C3). This file is the frame codec and
@@ -62,6 +63,9 @@ const (
 	OpWSReady       = "ws-ready"
 	OpWSData        = "ws-data"
 	OpWSEnd         = "ws-end"
+	OpDiagPing      = "diag-ping"
+	OpDiagPong      = "diag-pong"
+	OpDiagSpan      = "diag-span"
 )
 
 // Cancel/error reason vocabulary (C4 §2). Fixed enums, never free text.
@@ -74,6 +78,19 @@ const (
 	ReasonProtocolError       = "protocol_error"
 	ReasonServerShutdown      = "server_shutdown"
 )
+
+// TunnelTraceEvent is a timing milestone observed while a diagnostic capture
+// is active. Elapsed is measured on the process that emitted the event; values
+// from different machines must not be subtracted from one another.
+type TunnelTraceEvent struct {
+	ReqID      string
+	Stage      string
+	Elapsed    time.Duration
+	Duration   time.Duration
+	HubElapsed time.Duration
+	Status     int
+	Bytes      int64
+}
 
 // ErrWireFrameTooLarge is returned when an encoded or decoded frame exceeds
 // MaxWireFrame.
@@ -90,12 +107,18 @@ type Header struct {
 
 // Frame is one http-tunnel-v1 frame. Only the fields relevant to an op are set.
 type Frame struct {
-	V             int    `json:"v"`
-	Type          string `json:"type"`
-	TunnelVersion int    `json:"tunnelVersion"`
-	ConnID        string `json:"connId"`
-	ReqID         string `json:"reqId"`
-	Op            string `json:"op"`
+	V              int    `json:"v"`
+	Type           string `json:"type"`
+	TunnelVersion  int    `json:"tunnelVersion"`
+	ConnID         string `json:"connId"`
+	ReqID          string `json:"reqId"`
+	Op             string `json:"op"`
+	DiagRunID      string `json:"diagRunId,omitempty"`
+	DiagStage      string `json:"diagStage,omitempty"`
+	DiagElapsedNS  int64  `json:"diagElapsedNs,omitempty"`
+	DiagDurationNS int64  `json:"diagDurationNs,omitempty"`
+	DiagStatus     int    `json:"diagStatus,omitempty"`
+	DiagBytes      int64  `json:"diagBytes,omitempty"`
 
 	// data
 	Lane       string `json:"lane,omitempty"`
@@ -103,11 +126,11 @@ type Frame struct {
 	PayloadB64 string `json:"payloadB64,omitempty"`
 
 	// http-open / ws-open
-	Method         string            `json:"method,omitempty"`
-	Target         string            `json:"target,omitempty"`
-	Headers        []Header          `json:"headers,omitempty"`
-	PublicOrigin   string            `json:"publicOrigin,omitempty"`
-	InitialWindows map[string]int64  `json:"initialWindows,omitempty"`
+	Method         string           `json:"method,omitempty"`
+	Target         string           `json:"target,omitempty"`
+	Headers        []Header         `json:"headers,omitempty"`
+	PublicOrigin   string           `json:"publicOrigin,omitempty"`
+	InitialWindows map[string]int64 `json:"initialWindows,omitempty"`
 
 	// response-start
 	Status           int      `json:"status,omitempty"`

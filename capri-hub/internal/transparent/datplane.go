@@ -67,25 +67,33 @@ type DataPlane struct {
 	tickets   *TunnelTicketStore
 	bodyLimit int64
 	now       func() time.Time
+	diags     *diagnosticStore
 
-	mu    sync.Mutex
-	conns map[string]*hostConn // hostID -> live data session
+	mu            sync.Mutex
+	conns         map[string]*hostConn // hostID -> live data session
+	reconnects    map[string]int
+	everConnected map[string]bool
 }
 
 type hostConn struct {
-	connID string
-	client *transport.TunnelClient
+	connID      string
+	client      *transport.TunnelClient
+	transport   string
+	connectedAt time.Time
 }
 
 // NewDataPlane builds a data plane over shared hub state.
 func NewDataPlane(router *Router, sessions *SessionStore, bodyLimit int64) *DataPlane {
 	return &DataPlane{
-		router:    router,
-		sessions:  sessions,
-		tickets:   NewTunnelTicketStore(),
-		bodyLimit: bodyLimit,
-		now:       time.Now,
-		conns:     make(map[string]*hostConn),
+		router:        router,
+		sessions:      sessions,
+		tickets:       NewTunnelTicketStore(),
+		bodyLimit:     bodyLimit,
+		now:           time.Now,
+		diags:         newDiagnosticStore(),
+		conns:         make(map[string]*hostConn),
+		reconnects:    make(map[string]int),
+		everConnected: make(map[string]bool),
 	}
 }
 
@@ -134,7 +142,11 @@ func (d *DataPlane) HandleHostTunnel(w http.ResponseWriter, r *http.Request) {
 	tc.Start()
 
 	d.mu.Lock()
-	d.conns[hostID] = &hostConn{connID: connID, client: tc}
+	if d.everConnected[hostID] {
+		d.reconnects[hostID]++
+	}
+	d.everConnected[hostID] = true
+	d.conns[hostID] = &hostConn{connID: connID, client: tc, transport: "WSS over TCP/TLS", connectedAt: d.now()}
 	d.mu.Unlock()
 
 	defer func() {
@@ -146,6 +158,36 @@ func (d *DataPlane) HandleHostTunnel(w http.ResponseWriter, r *http.Request) {
 		_ = c.Close(websocket.StatusNormalClosure, "")
 	}()
 	<-r.Context().Done()
+}
+
+// AttachHostQUIC attaches the transparent request plane to an authenticated
+// QUIC connection. The ticket is single-use and was issued by
+// IssueTunnelTicket over the authenticated HTTPS control path.
+func (d *DataPlane) AttachHostQUIC(ticket string, conn transport.FrameConn) bool {
+	hostID, ok := d.tickets.Consume(ticket, d.now())
+	if !ok {
+		return false
+	}
+	connID := randID()
+	tc := transport.NewTunnelClient(connID, conn, d.bodyLimit)
+	d.mu.Lock()
+	if d.everConnected[hostID] {
+		d.reconnects[hostID]++
+	}
+	d.everConnected[hostID] = true
+	d.conns[hostID] = &hostConn{connID: connID, client: tc, transport: "QUIC over UDP/TLS", connectedAt: d.now()}
+	d.mu.Unlock()
+	tc.Start()
+	go func() {
+		<-tc.Done()
+		d.mu.Lock()
+		if hc := d.conns[hostID]; hc != nil && hc.connID == connID {
+			delete(d.conns, hostID)
+		}
+		d.mu.Unlock()
+		_ = conn.Close()
+	}()
+	return true
 }
 
 // ServeHost handles a request arriving on a host origin. It returns false when
@@ -183,18 +225,18 @@ func (d *DataPlane) ServeHost(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
-	d.mu.Lock()
-	hc := d.conns[hostID]
-	d.mu.Unlock()
-	if hc == nil {
-		writeErr(w, http.StatusServiceUnavailable, "host data connection not ready")
-		return true
-	}
 	if isWebSocketUpgrade(r) {
+		d.mu.Lock()
+		hc := d.conns[hostID]
+		d.mu.Unlock()
+		if hc == nil {
+			writeErr(w, http.StatusServiceUnavailable, "host data connection not ready")
+			return true
+		}
 		_ = hc.client.ServeUpgrade(r.Context(), w, r, d.router.OriginFor(label))
 		return true
 	}
-	_ = hc.client.ServeHTTP(r.Context(), w, r, d.router.OriginFor(label))
+	_ = d.recordRequest(hostID, r, w, d.router.OriginFor(label))
 	return true
 }
 

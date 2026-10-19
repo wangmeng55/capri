@@ -65,6 +65,8 @@ func main() {
 			HostToken: os.Getenv("OCHOST_HOST_TOKEN"),
 			Target:    proxy,
 			BodyLimit: 0,
+			QUICPort:  envInt("OCHOST_HUB_QUIC_PORT", 8788),
+			DisableQUIC: strings.TrimSpace(os.Getenv("OCHOST_DISABLE_QUIC")) == "1",
 		})
 		log.Printf("[opencode-host] connecting to hub %s as host %q", hubURL, hostID)
 	}

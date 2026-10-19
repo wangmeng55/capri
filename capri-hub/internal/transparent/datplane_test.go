@@ -47,7 +47,7 @@ func (m *mockTarget) ForwardUpgrade(ctx context.Context, method, target string, 
 // by the host-only view cookie.
 func TestDataPlaneHostOriginRoundTrip(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/global/health" {
+		if r.URL.Path != "/global/health" && r.URL.Path != "/health" {
 			w.WriteHeader(404)
 			return
 		}
@@ -142,5 +142,50 @@ func TestDataPlaneHostOriginRoundTrip(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusTeapot {
 		t.Fatalf("shell fallthrough status = %d, want 418", resp.StatusCode)
+	}
+
+	// A one-click diagnostic performs WSS ping + local /health, then captures
+	// the next actual browser request and correlates both sides by reqId.
+	baseline, err := dp.StartDiagnostic(ctx, "shell-owner", "h1")
+	if err != nil {
+		t.Fatalf("start diagnostic: %v", err)
+	}
+	if !baseline.TunnelConnected || len(baseline.HubHost) != 3 || baseline.HostHealth.Status != http.StatusOK {
+		t.Fatalf("diagnostic baseline incomplete: %+v", baseline)
+	}
+	if !dp.diags.beginCapture(baseline.RunID, "shell-owner", time.Now()) {
+		t.Fatal("diagnostic capture did not start")
+	}
+	req, _ = http.NewRequest(http.MethodGet, hub.URL+"/global/health?private=must-not-be-recorded", nil)
+	req.Host = hostAuthority
+	req.AddCookie(&http.Cookie{Name: ViewCookie, Value: viewID})
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("diagnostic captured GET: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		partial, ok := dp.diags.snapshot(baseline.RunID, "shell-owner")
+		if ok && len(partial.Requests) == 1 && partial.Requests[0].State == "complete" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hub did not record terminal frame before timeout: %+v", partial.Requests)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	dp.diags.stop(baseline.RunID, "shell-owner")
+	report, ok := dp.diags.snapshot(baseline.RunID, "shell-owner")
+	if !ok || len(report.Requests) != 1 {
+		t.Fatalf("captured diagnostic report: ok=%v requests=%+v", ok, report.Requests)
+	}
+	captured := report.Requests[0]
+	if captured.State != "complete" || captured.HubStatus != http.StatusOK || captured.HostStatus != http.StatusOK || captured.HostCompleteMS == nil || *captured.HostCompleteMS <= 0 || captured.ResponseBytes == 0 {
+		t.Fatalf("request stages not fully correlated: %+v", captured)
+	}
+	if strings.Contains(captured.Path, "private") || strings.Contains(captured.Path, "must-not-be-recorded") {
+		t.Fatalf("query string leaked into diagnostic path: %q", captured.Path)
 	}
 }

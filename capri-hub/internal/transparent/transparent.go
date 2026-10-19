@@ -87,6 +87,7 @@ func (g *Gateway) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/auth/logout", g.handleLogout)
 	mux.HandleFunc("POST /api/hosts/{hostId}/view-ticket", g.handleViewTicket)
 	mux.HandleFunc("POST /__capri/session", g.handleViewSession)
+	g.registerDiagnosticRoutes(mux)
 	// Host data connection (C3 §1). Hosts are native programs and present the
 	// one-time tunnel ticket via Authorization: Bearer.
 	mux.HandleFunc("GET /ws/host/tunnel", g.plane.HandleHostTunnel)

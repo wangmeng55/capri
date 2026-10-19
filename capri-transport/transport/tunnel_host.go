@@ -168,6 +168,7 @@ func (h *HostTunnel) openHTTP(ctx context.Context, connID string, send FrameSend
 	}
 	hr := newHostReq(ctx, connID, f, send)
 	hr.bodyLimit = h.bodyLimit
+	hr.trace("received", 0, 0)
 	h.put(hr)
 	go h.runHTTP(hr, f)
 	return nil
@@ -183,8 +184,12 @@ func (h *HostTunnel) runHTTP(hr *hostReq, f *Frame) {
 		return
 	}
 	req.Header = HeadersToHTTP(f.Headers)
+	req = req.WithContext(WithTunnelTraceObserver(req.Context(), func(ev TunnelTraceEvent) {
+		hr.traceDuration(ev.Stage, ev.Status, ev.Bytes, ev.Duration)
+	}))
 
 	w := &hostResponseWriter{hr: hr, hdr: http.Header{}}
+	hr.trace("local_start", 0, 0)
 	func() {
 		defer func() {
 			if p := recover(); p != nil {

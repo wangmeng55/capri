@@ -41,6 +41,12 @@ func (a *TunnelHostAgent) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if f.Op == OpDiagPing {
+			if err := send(&Frame{ConnID: a.connID, ReqID: f.ReqID, Op: OpDiagPong, DiagRunID: f.DiagRunID}); err != nil {
+				return err
+			}
+			continue
+		}
 		if herr := a.tunnel.Handle(ctx, a.connID, send, f); herr != nil {
 			// A malformed or unknown-reqId frame is ignored; the connection
 			// keeps serving other requests (tombstones handled in HostTunnel).

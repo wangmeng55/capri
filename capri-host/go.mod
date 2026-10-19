@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/coder/websocket v1.8.14
+	github.com/quic-go/quic-go v0.61.0
 )
 
 require github.com/AgentsHarness/capri-transport v0.0.0

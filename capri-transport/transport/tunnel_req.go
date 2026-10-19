@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // FrameSender writes one encoded frame onto the connection the request arrived
@@ -16,9 +17,11 @@ type FrameSender func(*Frame) error
 
 // hostReq is one in-flight transparent request on the host side.
 type hostReq struct {
-	connID string
-	reqID  string
-	head   bool
+	connID      string
+	reqID       string
+	head        bool
+	diagRunID   string
+	diagStarted time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -63,20 +66,39 @@ func newHostReq(parent context.Context, connID string, f *Frame, send FrameSende
 		}
 	}
 	return &hostReq{
-		connID:     connID,
-		reqID:      f.ReqID,
-		head:       f.Op == OpHTTPOpen && f.Method == http.MethodHead,
-		ctx:        ctx,
-		cancel:     cancel,
-		bodyR:      r,
-		bodyW:      w,
-		respFlow:   newFlowWindow(respWin),
-		reqAck:     newAckWindow(reqWin),
-		wsDownFlow: newFlowWindow(respWin),
-		wsUpAck:    newAckWindow(reqWin),
-		bodyLimit:  MaxTunnelBodyBytes,
-		sender:     send,
+		connID:      connID,
+		reqID:       f.ReqID,
+		head:        f.Op == OpHTTPOpen && f.Method == http.MethodHead,
+		diagRunID:   f.DiagRunID,
+		diagStarted: time.Now(),
+		ctx:         ctx,
+		cancel:      cancel,
+		bodyR:       r,
+		bodyW:       w,
+		respFlow:    newFlowWindow(respWin),
+		reqAck:      newAckWindow(reqWin),
+		wsDownFlow:  newFlowWindow(respWin),
+		wsUpAck:     newAckWindow(reqWin),
+		bodyLimit:   MaxTunnelBodyBytes,
+		sender:      send,
 	}
+}
+
+func (hr *hostReq) trace(stage string, status int, bytes int64) {
+	hr.traceDuration(stage, status, bytes, 0)
+}
+
+func (hr *hostReq) traceDuration(stage string, status int, bytes int64, duration time.Duration) {
+	if hr.diagRunID == "" {
+		return
+	}
+	_ = hr.send(&Frame{
+		ConnID: hr.connID, ReqID: hr.reqID, Op: OpDiagSpan,
+		DiagRunID: hr.diagRunID, DiagStage: stage,
+		DiagElapsedNS:  time.Since(hr.diagStarted).Nanoseconds(),
+		DiagDurationNS: duration.Nanoseconds(),
+		DiagStatus:     status, DiagBytes: bytes,
+	})
 }
 
 // send serializes frame emission for this request.
@@ -200,11 +222,13 @@ func (hr *hostReq) applyWindow(f *Frame) {
 // failBeforeHeaders emits a terminal HTTP response when nothing has been sent.
 func (hr *hostReq) failBeforeHeaders(status int, msg string) {
 	body, _ := json.Marshal(map[string]any{"ok": false, "error": msg})
+	hr.trace("local_first_response", status, 0)
 	hr.send(&Frame{ConnID: hr.connID, ReqID: hr.reqID, Op: OpResponseStart, Status: status,
 		Headers: []Header{{Name: "Content-Type", Values: []string{"application/json"}}}})
 	df := &Frame{ConnID: hr.connID, ReqID: hr.reqID, Op: OpResponseData, Lane: LaneResponse, Offset: 0}
 	df.setPayload(body)
 	hr.send(df)
+	hr.trace("local_complete", status, int64(len(body)))
 	hr.send(&Frame{ConnID: hr.connID, ReqID: hr.reqID, Op: OpResponseEnd, Offset: int64(len(body))})
 }
 
@@ -267,12 +291,14 @@ func (hr *hostReq) abort() {
 
 // hostResponseWriter streams a handler's response as response-start/data/end.
 type hostResponseWriter struct {
-	hr        *hostReq
-	hdr       http.Header
-	status    int
-	wroteHead bool
-	offset    int64
-	err       error
+	hr          *hostReq
+	hdr         http.Header
+	status      int
+	wroteHead   bool
+	offset      int64
+	err         error
+	flowWait    time.Duration
+	tunnelWrite time.Duration
 }
 
 func (w *hostResponseWriter) Header() http.Header { return w.hdr }
@@ -283,6 +309,7 @@ func (w *hostResponseWriter) WriteHeader(code int) {
 	}
 	w.wroteHead = true
 	w.status = code
+	w.hr.trace("local_first_response", code, w.offset)
 	f := &Frame{ConnID: w.hr.connID, ReqID: w.hr.reqID, Op: OpResponseStart, Status: code, Headers: HeadersFromHTTP(w.hdr)}
 	if names := declaredTrailers(w.hdr); len(names) > 0 {
 		f.DeclaredTrailers = names
@@ -311,16 +338,22 @@ func (w *hostResponseWriter) Write(p []byte) (int, error) {
 		chunk := p[:n]
 		p = p[n:]
 		end := w.offset + int64(n)
+		waitStarted := time.Now()
 		if err := w.hr.respFlow.wait(w.hr.ctx, end); err != nil {
+			w.flowWait += time.Since(waitStarted)
 			w.err = err
 			return total, err
 		}
+		w.flowWait += time.Since(waitStarted)
 		df := &Frame{ConnID: w.hr.connID, ReqID: w.hr.reqID, Op: OpResponseData, Lane: LaneResponse, Offset: w.offset}
 		df.setPayload(chunk)
+		sendStarted := time.Now()
 		if err := w.hr.send(df); err != nil {
+			w.tunnelWrite += time.Since(sendStarted)
 			w.err = err
 			return total, err
 		}
+		w.tunnelWrite += time.Since(sendStarted)
 		w.offset = end
 		total += n
 	}
@@ -338,10 +371,13 @@ func (w *hostResponseWriter) finish() {
 	if !w.wroteHead {
 		w.WriteHeader(http.StatusOK)
 	}
+	w.hr.traceDuration("flow_wait_total", w.status, w.offset, w.flowWait)
+	w.hr.traceDuration("tunnel_write_total", w.status, w.offset, w.tunnelWrite)
 	end := &Frame{ConnID: w.hr.connID, ReqID: w.hr.reqID, Op: OpResponseEnd, Offset: w.offset}
 	if tr := collectTrailers(w.hdr); len(tr) > 0 {
 		end.Trailers = tr
 	}
+	w.hr.trace("local_complete", w.status, w.offset)
 	w.hr.send(end)
 }
 

@@ -32,6 +32,23 @@
     .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:#666; }
     .dot.on { background:#39d98a; } .dot.ready { background:#5b8cff; } .dot.off { background:#777; }
     .note { color:var(--mut); font-size:13px; padding:12px; }
+    .diag-button { width:100%; min-height:38px; }
+    #app.sidebar-collapsed .diag-button { font-size:0; }
+    #app.sidebar-collapsed .diag-button::after { content:"⌁"; font-size:20px; }
+    .diag-backdrop { position:fixed; inset:auto 12px 12px auto; z-index:10; display:flex; align-items:flex-end; justify-content:flex-end; padding:0; background:transparent; pointer-events:none; }
+    .diag-backdrop[hidden] { display:none; }
+    .diag-panel { pointer-events:auto; width:min(760px,calc(100vw - 24px)); max-height:72dvh; overflow:auto; border:1px solid var(--line); border-radius:14px; padding:16px; background:var(--bg); color:var(--fg); box-shadow:0 12px 40px #0008; }
+    .diag-restore { position:fixed; right:12px; bottom:12px; z-index:11; box-shadow:0 4px 16px #0008; }
+    .diag-panel h2 { margin:0 0 10px; font-size:19px; }
+    .diag-panel h3 { margin:18px 0 6px; font-size:15px; }
+    .diag-panel p { margin:8px 0; }
+    .diag-muted { color:var(--mut); font-size:13px; }
+    .diag-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+    .diag-card { border:1px solid var(--line); border-radius:9px; padding:10px; margin:8px 0; background:var(--card); }
+    .diag-scroll { overflow:auto; }
+    .diag-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .diag-table th,.diag-table td { text-align:left; padding:6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+    @media (max-width:520px) { .diag-backdrop { inset:auto 8px 8px; } .diag-panel { width:100%; max-height:72dvh; border-radius:12px; border:1px solid var(--line); padding:14px; } .diag-restore { right:8px; bottom:8px; } }
   </style>
 </head>
 <body>
@@ -53,6 +70,7 @@
     <main>
       <aside id="hosts">
         <button class="ghost" id="toggleHosts" type="button" aria-controls="hostList" aria-expanded="true" aria-label="Hide host list" title="Hide host list">☰</button>
+        <button class="diag-button" id="diagnose" type="button" title="诊断当前主机连接">连接诊断</button>
         <div id="hostList"><div class="empty">Loading hosts…</div></div>
       </aside>
       <section class="view" id="view">
@@ -60,11 +78,24 @@
         <iframe id="frame" name="frame" title="agent view" hidden></iframe>
       </section>
     </main>
+    <div class="diag-backdrop" id="diagBackdrop" hidden>
+      <section class="diag-panel" role="dialog" aria-modal="false" aria-labelledby="diagTitle">
+        <h2 id="diagTitle">连接诊断</h2>
+        <div id="diagContent" aria-live="polite"><p>尚未开始。</p></div>
+        <div class="diag-actions">
+          <button class="ghost" id="diagMinimize" type="button">收起</button>
+          <button class="ghost" id="diagStop" type="button" hidden>停止捕获</button>
+          <button class="ghost" id="diagExport" type="button" hidden>导出 JSON</button>
+          <button class="ghost" id="diagClose" type="button">关闭</button>
+        </div>
+      </section>
+    </div>
+    <button class="diag-restore" id="diagRestore" type="button" hidden>打开连接诊断</button>
   </div>
 
   <script>
     "use strict";
-    var state = { csrf: "", hosts: [], accessToken: sessionStorage.getItem("capri-token") || "" };
+    var state = { csrf: "", hosts: [], accessToken: sessionStorage.getItem("capri-token") || "", selectedHost: null, diagRunID: "", diagReport: null, diagPoll: 0, diagCountdown: 0 };
 
     function $(id) { return document.getElementById(id); }
     function show(el, on) { el.hidden = !on; }
@@ -126,12 +157,14 @@
 
     $("logout").addEventListener("click", async function () {
       await api("/api/auth/logout", { method: "POST" });
+      stopDiagnosticPolling(); state.diagRunID = ""; state.diagReport = null; state.selectedHost = null;
       state.accessToken = ""; sessionStorage.removeItem("capri-token");
       state.csrf = ""; state.hosts = [];
       $("frame").hidden = true; $("frame").src = "about:blank";
       show($("viewHint"), true);
       $("hostList").innerHTML = "";
       show($("app"), false); show($("login"), true);
+      show($("diagBackdrop"), false); show($("diagRestore"), false);
     });
 
     async function loadHosts() {
@@ -163,7 +196,145 @@
       return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
     }); }
 
+    function diagMS(value) { return Number.isFinite(value) ? value.toFixed(1) + " ms" : "不可用"; }
+
+    function renderDiagnostic(report, countdown) {
+      state.diagReport = report;
+      var browser = report.browserToHub || [];
+      var tunnel = report.hubToHostRtt || report.hubToHostWss || [];
+      var good = function (items) { return items.filter(function (x) { return x.result === "ok"; }); };
+      var summarize = function (items) {
+        var ok = good(items);
+        if (!ok.length) return "无成功样本（" + items.map(function (x) { return x.result; }).join(", ") + "）";
+        var vals = ok.map(function (x) { return x.durationMs; }).sort(function (a,b) { return a-b; });
+        return "中位数 " + diagMS(vals[Math.floor(vals.length / 2)]) + "；成功 " + ok.length + "/" + items.length;
+      };
+      var health = report.hostHealth || {};
+      var rows = (report.requests || []).map(function (r) {
+        return "<tr><td>" + escapeHtml(r.method) + "</td><td>" + escapeHtml(r.path) + "</td><td>" + escapeHtml(r.state) + (r.failureStage ? " · " + escapeHtml(r.failureStage) : "") + "</td><td>" + (r.hubStatus || "—") + " / " + (r.hostStatus || "—") + "</td>" +
+          "<td>" + diagMS(r.hubToTunnelMs) + "</td><td>" + diagMS(r.hubHostReceiptConfirmMs) + "</td><td>" + diagMS(r.hostLocalStartMs) + "</td><td>" + diagMS(r.hostFirstResponseMs) + "</td><td>" + diagMS(r.hostFirstBodyByteMs) + "</td><td>" + diagMS(r.hostBodyReadMs) + (r.hostBodyReadBytes ? " · " + r.hostBodyReadBytes + " B" : "") + "</td>" +
+          "<td>" + diagMS(r.hostFlowWaitMs) + "</td><td>" + diagMS(r.hostTunnelWriteMs) + "</td><td>" + diagMS(r.hostCompleteMs) + "</td><td>" + diagMS(r.hubHostCompleteReceiptMs) + "</td><td>" + diagMS(r.hubAfterHostCompleteMs) + "</td><td>" + diagMS(r.hubFirstDataMs) + "</td><td>" + diagMS(r.hubMaxDataGapMs) + "</td><td>" + diagMS(r.hubAfterLastDataMs) + "</td><td>" + (r.hubDataFrames || 0) + "</td><td>" + diagMS(r.hubFrameWaitMs) + "</td><td>" + diagMS(r.hubClientWriteMs) + "</td><td>" + diagMS(r.hubTotalMs) + "</td><td>" + (r.responseBytes || 0) + "</td></tr>";
+      }).join("");
+      var captureText = report.state === "capturing" ? "请点“收起”后切换一次会话。剩余约 " + countdown + " 秒；收起后仍会继续捕获请求元数据，不记录正文。" :
+        (report.state === "ready" ? "基线探测完成，准备开始捕获。" : "捕获已结束。已记录 " + (report.requests || []).length + " 个请求" + (report.omittedRequests ? "，另有 " + report.omittedRequests + " 个因上限未记录" : "") + "。");
+      $("diagContent").innerHTML =
+        '<p><strong>' + escapeHtml(captureText) + '</strong></p>' +
+        '<div class="diag-card">主机：' + escapeHtml(report.hostId) + '<br>数据通道：' + escapeHtml(report.transport) + ' · ' + (report.tunnelConnected ? "已连接" : "未连接") + (report.tunnelConnected ? " · 已连接 " + diagMS(report.tunnelAgeMs) : "") + '<br>Hub 观察到重连：' + (report.reconnects || 0) + ' 次</div>' +
+        '<h3>基线探测</h3><div class="diag-card">手机浏览器 → Hub：' + escapeHtml(summarize(browser)) + '<br>Hub → Host 隧道往返：' + escapeHtml(summarize(tunnel)) + '<br>Host → OpenCode /health：' + escapeHtml(health.result || "不可用") + (health.status ? " · HTTP " + health.status : "") + (health.durationMs ? " · 总计 " + diagMS(health.durationMs) : "") + (health.hubWaitMs ? " · Hub 等首响 " + diagMS(health.hubWaitMs) : "") + (health.hostLocalMs ? " · Host 本机处理 " + diagMS(health.hostLocalMs) : "") + (health.responseBytes ? " · " + health.responseBytes + " B" : "") + '</div>' +
+        '<h3>捕获到的真实请求</h3>' + (rows ? '<div class="diag-scroll"><table class="diag-table"><thead><tr><th>方法</th><th>路径（不含查询）</th><th>状态/失败阶段</th><th>HTTP Hub/Host</th><th>Hub 发隧道</th><th>Hub 收到 Host 回执</th><th>Host 调 OpenCode</th><th>OpenCode 响应头</th><th>OpenCode 首正文</th><th>Host 读正文阻塞累计</th><th>Host 流控等待</th><th>Host 隧道写阻塞</th><th>Host 转发完成</th><th>Hub 收到 Host 完成</th><th>Host 完成后 Hub 等待结束帧</th><th>Hub 收到首块正文</th><th>Hub 最大块间隔</th><th>Hub 最后一块后等结束帧</th><th>正文帧数</th><th>Hub 等隧道帧</th><th>Hub 写浏览器</th><th>Hub 总计</th><th>返回字节</th></tr></thead><tbody>' + rows + '</tbody></table></div>' : '<p class="diag-muted">切换会话后，请求会显示在这里。</p>') +
+        '<p class="diag-muted">' + escapeHtml(report.packetLossNote || "") + '</p>' +
+        '<p class="diag-muted">Host 读正文阻塞累计只统计等待 OpenCode Read 返回数据的时间；Host 隧道写阻塞统计本机写帧所花时间，不代表对端已确认收到。新增的 Hub 帧时点都使用 Hub 自己的计时：Host 完成通知到结束帧的间隔可定位响应结束阶段；首块、最大块间隔和末块到结束帧可定位正文传输停顿。Hub 等帧包含等待 Host 数据、生成和传输的时间；Hub 写浏览器只统计 Hub 响应写入/Flush 调用时间。Hub 收到 Host 回执是往返确认，不是单程延迟。各进程使用自己的单调计时，不跨机器相减。hostReceivedMs 是 Host 计时起点，接近 0 属正常。浏览器到 Hub 是 HTTPS 往返探测，不是 iframe 单条请求的 Resource Timing。</p>';
+      show($("diagStop"), report.state === "capturing");
+      show($("diagExport"), report.state !== "capturing");
+    }
+
+    function stopDiagnosticPolling() {
+      if (state.diagPoll) { clearInterval(state.diagPoll); state.diagPoll = 0; }
+      if (state.diagCountdown) { clearInterval(state.diagCountdown); state.diagCountdown = 0; }
+    }
+
+    async function pollDiagnostic() {
+      if (!state.diagRunID) return;
+      var r = await api("/api/diagnostics/" + encodeURIComponent(state.diagRunID));
+      if (!r.ok || !r.data) return;
+      var left = Math.max(0, Math.ceil(((state.diagUntil || Date.now()) - Date.now()) / 1000));
+      renderDiagnostic(r.data, left);
+      if (r.data.state !== "capturing") { stopDiagnosticPolling(); $("diagnose").disabled = false; }
+    }
+
+    async function startDiagnostics() {
+      if (!state.selectedHost) {
+        $("diagContent").innerHTML = "<p>请先选择一台主机，再开始诊断。</p>";
+        show($("diagBackdrop"), true); show($("diagRestore"), false);
+        return;
+      }
+      stopDiagnosticPolling();
+      $("diagnose").disabled = true;
+      state.diagRunID = ""; state.diagReport = null;
+      $("diagContent").innerHTML = "<p>正在检查 Host 隧道并请求本机健康接口…</p>";
+      show($("diagBackdrop"), true); show($("diagRestore"), false); show($("diagStop"), false); show($("diagExport"), false);
+      var started = await api("/api/diagnostics", { method: "POST", body: JSON.stringify({ hostId: state.selectedHost.hostId }) });
+      if (!started.ok || !started.data || !started.data.runId) {
+        $("diagContent").textContent = (started.data && started.data.error) || ("无法启动诊断（" + started.status + "）");
+        $("diagnose").disabled = false;
+        return;
+      }
+      state.diagRunID = started.data.runId;
+      $("diagContent").innerHTML = "<p>正在测量手机浏览器到 Hub 的 HTTPS 往返…</p>";
+      var samples = [];
+      for (var i = 0; i < 5; i++) {
+        $("diagContent").innerHTML = "<p>正在测量手机浏览器到 Hub 的 HTTPS 往返…（" + (i + 1) + "/5）</p>";
+        var begin = performance.now();
+        var controller = new AbortController();
+        var timer = setTimeout(function () { controller.abort(); }, 5000);
+        var ping;
+        try { ping = await api("/api/diagnostics/" + encodeURIComponent(state.diagRunID) + "/ping", { signal: controller.signal, cache: "no-store" }); }
+        catch (e) { ping = { ok: false, status: 0 }; }
+        clearTimeout(timer);
+        samples.push({ durationMs: performance.now() - begin, result: ping.ok ? "ok" : (ping.status === 0 ? "timeout" : "failed") });
+      }
+      var saved = await api("/api/diagnostics/" + encodeURIComponent(state.diagRunID) + "/browser-samples", { method: "POST", body: JSON.stringify({ samples: samples }) });
+      if (!saved.ok) { $("diagContent").textContent = "浏览器探测结果未能保存（" + saved.status + "）。"; $("diagnose").disabled = false; return; }
+      var capture = await api("/api/diagnostics/" + encodeURIComponent(state.diagRunID) + "/capture", { method: "POST", body: "{}" });
+      if (!capture.ok || !capture.data) { $("diagContent").textContent = "无法开始请求捕获（" + capture.status + "）。"; $("diagnose").disabled = false; return; }
+      state.diagReport = capture.data;
+      state.diagUntil = Date.now() + 60000;
+      renderDiagnostic(capture.data, 60);
+      state.diagCountdown = setInterval(function () {
+        var left = Math.max(0, Math.ceil((state.diagUntil - Date.now()) / 1000));
+        if (state.diagReport && state.diagReport.state === "capturing") {
+          $("diagContent").firstElementChild.innerHTML = "<strong>请点“收起”后切换一次会话。剩余约 " + left + " 秒；收起后仍会继续捕获请求元数据，不记录正文。</strong>";
+        }
+      }, 1000);
+      state.diagPoll = setInterval(pollDiagnostic, 1500);
+    }
+
+    $("diagnose").addEventListener("click", function () {
+      startDiagnostics().catch(function () {
+        $("diagContent").textContent = "诊断请求中断，请检查当前网络或主机连接后重试。";
+        $("diagnose").disabled = false;
+      });
+    });
+    async function closeDiagnostic() {
+      var shouldStop = state.diagRunID && state.diagReport && state.diagReport.state === "capturing";
+      show($("diagBackdrop"), false); show($("diagRestore"), false);
+      if (shouldStop) {
+        stopDiagnosticPolling();
+        $("diagnose").disabled = false;
+        try {
+          var stopped = await api("/api/diagnostics/" + encodeURIComponent(state.diagRunID) + "/stop", { method: "POST", body: "{}" });
+          if (stopped.ok && stopped.data) state.diagReport = stopped.data;
+        } catch (e) {}
+      }
+    }
+    $("diagClose").addEventListener("click", closeDiagnostic);
+    $("diagMinimize").addEventListener("click", function () {
+      show($("diagBackdrop"), false);
+      show($("diagRestore"), true);
+    });
+    $("diagRestore").addEventListener("click", function () {
+      show($("diagRestore"), false);
+      show($("diagBackdrop"), true);
+    });
+    $("diagBackdrop").addEventListener("click", function (e) { if (e.target === $("diagBackdrop")) closeDiagnostic(); });
+    $("diagStop").addEventListener("click", async function () {
+      if (!state.diagRunID) return;
+      var r = await api("/api/diagnostics/" + encodeURIComponent(state.diagRunID) + "/stop", { method: "POST", body: "{}" });
+      if (r.ok && r.data) renderDiagnostic(r.data, 0);
+      stopDiagnosticPolling();
+      $("diagnose").disabled = false;
+    });
+    $("diagExport").addEventListener("click", function () {
+      if (!state.diagReport) return;
+      var blob = new Blob([JSON.stringify(state.diagReport, null, 2)], { type: "application/json" });
+      var link = document.createElement("a");
+      link.href = URL.createObjectURL(blob); link.download = "capri-diagnostic-" + state.diagReport.runId + ".json";
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(function () { URL.revokeObjectURL(link.href); }, 60000);
+    });
+
     async function selectHost(h, btn) {
+      state.selectedHost = h;
       Array.prototype.forEach.call(document.querySelectorAll(".host"), function (b) { b.setAttribute("aria-selected", "false"); });
       if (btn) btn.setAttribute("aria-selected", "true");
       // Redeem a one-time view ticket into a host-only cookie, then

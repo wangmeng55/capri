@@ -41,6 +41,7 @@ import (
 
 	"github.com/AgentsHarness/capri-hub/internal/hub"
 	"github.com/AgentsHarness/capri-hub/internal/transparent"
+	"github.com/AgentsHarness/capri-transport/transport"
 	"github.com/coder/websocket"
 	"github.com/klauspost/compress/flate"
 	"github.com/quic-go/quic-go"
@@ -112,9 +113,10 @@ func main() {
 	lim := newPairLimiter()
 	lim.StartCleanup(runCtx)
 
+	handler, dataPlane := buildHandlerWithDataPlane(h, feToken, tickets, lim, corsOrigins)
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           buildHandler(h, feToken, tickets, lim, corsOrigins),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -142,7 +144,7 @@ func main() {
 				mode = "self-signed (dev)"
 			}
 			log.Printf("[capri-hub] QUIC host transport on udp://:%d (%s)", quicPort, mode)
-			go serveQUIC(ln, h)
+			go serveQUIC(ln, h, dataPlane)
 		}
 	}
 
@@ -161,6 +163,11 @@ func main() {
 
 // buildHandler wires all HTTP routes (shared by main and integration tests).
 func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairLimiter, corsOrigins []string) http.Handler {
+	handler, _ := buildHandlerWithDataPlane(h, feToken, tickets, lim, corsOrigins)
+	return handler
+}
+
+func buildHandlerWithDataPlane(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairLimiter, corsOrigins []string) (http.Handler, *transparent.DataPlane) {
 	if tickets == nil {
 		tickets = newFETicketStore()
 	}
@@ -179,7 +186,6 @@ func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairL
 	mux.HandleFunc("POST /api/pair", handlePair(h, lim))
 	mux.HandleFunc("GET /ws/host", handleHostWS(h))
 	// Browser-facing: FE token gate when FE_TOKEN is set.
-	mux.HandleFunc("GET /api/hosts", auth.require(handleHosts(h)))
 	mux.HandleFunc("DELETE /api/hosts/{hostId}", auth.require(handleUnpair(h)))
 	mux.HandleFunc("POST /api/hosts/{hostId}/rename", auth.require(handleRenameHost(h)))
 	mux.HandleFunc("GET /api/events", auth.require(handleEvents(h)))
@@ -209,6 +215,10 @@ func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairL
 		Secure:      !envTruthy("COOKIE_INSECURE"),
 	}, hostKnown)
 	gateway.RegisterRoutes(mux)
+	// The OpenCode host uses the transparent data tunnel, which is separate
+	// from the legacy control stream tracked by h.ListHosts(). Include that
+	// live tunnel in the browser-facing online indicator.
+	mux.HandleFunc("GET /api/hosts", auth.require(handleHosts(h, gateway.Plane().Connected)))
 	// Host data-connection ticket. Authenticated by the host's own pairing
 	// token (the design intends the ticket to be requested on the host's
 	// authenticated control session; the host token is the same identity,
@@ -225,7 +235,7 @@ func buildHandler(h *hub.Hub, feToken string, tickets *feTicketStore, lim *pairL
 	})
 	// Host-origin requests are bridged to their host's data connection; every
 	// other authority is served by the shell mux below.
-	return withCORS(gateway.Plane().Dispatch(mux), corsOrigins)
+	return withCORS(gateway.Plane().Dispatch(mux), corsOrigins), gateway.Plane()
 }
 
 func envTruthy(name string) bool {
@@ -530,10 +540,16 @@ func handleWSTicket(tickets *feTicketStore) http.HandlerFunc {
 	}
 }
 
-func handleHosts(h *hub.Hub) http.HandlerFunc {
+func handleHosts(h *hub.Hub, dataConnected func(string) bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		hosts := h.ListHosts()
+		for i := range hosts {
+			if !hosts[i].Online && dataConnected != nil && dataConnected(hosts[i].HostID) {
+				hosts[i].Online = true
+			}
+		}
 		writeJSON(w, 200, map[string]any{
-			"hosts":         h.ListHosts(),
+			"hosts":         hosts,
 			"defaultHostId": h.DefaultHostID(),
 		})
 	}
@@ -1418,14 +1434,14 @@ func quicTLSConfig(allowSelfSigned bool) (*tls.Config, error) {
 // listenQUIC opens the UDP QUIC listener for host transport.
 func listenQUIC(port int, tlsConf *tls.Config) (*quic.Listener, error) {
 	addr := fmt.Sprintf(":%d", port)
-	return quic.ListenAddr(addr, tlsConf, &quic.Config{KeepAlivePeriod: 10 * time.Second})
+	return quic.ListenAddr(addr, tlsConf, &quic.Config{KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: 256})
 }
 
 // serveQUIC accepts host connections over an already-open QUIC listener.
 // One bidirectional stream per connection carries the same JSON frame
 // protocol as /ws/host; auth is the first frame {type:"auth", token}.
 // Closing the listener ends the accept loop (graceful shutdown).
-func serveQUIC(ln *quic.Listener, h *hub.Hub) {
+func serveQUIC(ln *quic.Listener, h *hub.Hub, planes ...*transparent.DataPlane) {
 	for {
 		conn, err := ln.Accept(context.Background())
 		if err != nil {
@@ -1436,11 +1452,11 @@ func serveQUIC(ln *quic.Listener, h *hub.Hub) {
 			log.Printf("[capri-hub] QUIC accept: %v", err)
 			continue
 		}
-		go serveQUICConn(conn, h)
+		go serveQUICConn(conn, h, planes...)
 	}
 }
 
-func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
+func serveQUICConn(conn *quic.Conn, h *hub.Hub, planes ...*transparent.DataPlane) {
 	// A panic in a bare goroutine (no net/http recover) would kill the
 	// whole hub; contain it and drop just this connection.
 	defer func() {
@@ -1484,9 +1500,30 @@ func serveQUICConn(conn *quic.Conn, h *hub.Hub) {
 	var auth struct {
 		Type    string `json:"type"`
 		Token   string `json:"token"`
+		Ticket  string `json:"ticket"`
 		Deflate bool   `json:"deflate"`
 	}
-	if json.Unmarshal(data, &auth) != nil || auth.Type != "auth" || auth.Token == "" {
+	if json.Unmarshal(data, &auth) != nil {
+		_ = write([]byte(`{"v":1,"type":"auth_error","error":"invalid auth frame"}`))
+		return
+	}
+	if auth.Type == "transparent_auth" {
+		var plane *transparent.DataPlane
+		if len(planes) > 0 {
+			plane = planes[0]
+		}
+		if plane == nil || !plane.AttachHostQUIC(auth.Ticket, transport.NewQUICFrameConn(conn)) {
+			_ = write([]byte(`{"v":1,"type":"auth_error","error":"bad tunnel ticket"}`))
+			return
+		}
+		if err := write([]byte(`{"v":1,"type":"transparent_ready"}`)); err != nil {
+			return
+		}
+		_ = stream.Close()
+		<-conn.Context().Done()
+		return
+	}
+	if auth.Type != "auth" || auth.Token == "" {
 		_ = write([]byte(`{"v":1,"type":"auth_error","error":"missing auth"}`))
 		return
 	}

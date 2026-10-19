@@ -2,6 +2,14 @@ param(
     [string]$InstallPath = (Join-Path (Split-Path -Parent $PSScriptRoot) "dist\opencode-host.exe")
 )
 
+# Transport selection:
+#   To force the newly launched Host to use WSS, set this in the same
+#   PowerShell session before running this script:
+#       $env:OCHOST_DISABLE_QUIC = "1"
+#   Start-Process inherits that process-scoped setting. It affects this Host
+#   launch only; remove the variable before a later deployment to restore the
+#   default QUIC-first behavior (with WSS fallback).
+
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $goEnvScript = Join-Path $PSScriptRoot "goenv.ps1"
@@ -9,6 +17,9 @@ $installPath = [System.IO.Path]::GetFullPath($InstallPath)
 $installDir = Split-Path -Parent $installPath
 $stagePath = Join-Path $installDir ".opencode-host-$PID.new.exe"
 $backupPath = "$installPath.bak"
+$logDir = Join-Path $env:TEMP "capri-opencode-host"
+$stdoutLog = Join-Path $logDir "stdout.log"
+$stderrLog = Join-Path $logDir "stderr.log"
 $oldProcesses = @()
 $newProcess = $null
 $oldProcessesStopped = $false
@@ -81,14 +92,33 @@ try {
     Move-Item -LiteralPath $stagePath -Destination $installPath -Force
 
     Write-Host "Starting updated opencode-host..."
-    $newProcess = Start-Process -FilePath $installPath -WorkingDirectory $repoRoot -PassThru
-    Start-Sleep -Seconds 2
-    $newProcess.Refresh()
-    if ($newProcess.HasExited) {
-        throw "Updated opencode-host exited during startup (code $($newProcess.ExitCode))."
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    $newProcess = Start-Process -FilePath $installPath -WorkingDirectory $repoRoot -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+
+    # opencode-host's own OpenCode health startup deadline is 45 seconds;
+    # allow it to report a real startup error before the deployment rolls back.
+    $deadline = (Get-Date).AddSeconds(60)
+    $gatewayReady = $false
+    while ((Get-Date) -lt $deadline) {
+        $newProcess.Refresh()
+        if ($newProcess.HasExited) {
+            $errorText = if (Test-Path -LiteralPath $stderrLog) { Get-Content -LiteralPath $stderrLog -Raw } else { "" }
+            $outputText = if (Test-Path -LiteralPath $stdoutLog) { Get-Content -LiteralPath $stdoutLog -Raw } else { "" }
+            throw "Updated opencode-host exited during startup (code $($newProcess.ExitCode)). Output: $outputText $errorText"
+        }
+        if (Get-NetTCPConnection -LocalPort 41800 -State Listen -ErrorAction SilentlyContinue) {
+            $gatewayReady = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $gatewayReady) {
+        throw "Updated opencode-host stayed running but did not open local gateway port 41800 within 60 seconds. Logs: $stdoutLog and $stderrLog"
     }
 
-    Write-Host "Updated opencode-host is running (PID $($newProcess.Id))."
+    Write-Host "Updated opencode-host is running and local gateway is listening (PID $($newProcess.Id))."
+    Write-Host "Host logs: $stdoutLog and $stderrLog"
     Write-Host "Previous executable backup: $backupPath"
 }
 catch {

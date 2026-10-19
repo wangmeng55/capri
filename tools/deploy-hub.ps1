@@ -52,7 +52,10 @@ try {
     Push-Location $repoRoot
     try {
         Write-Host "Building Capri hub for Linux amd64..."
-        & go build -ldflags "-X main.version=$buildVersion" -o $binary ./capri-hub/cmd/capri-hub
+        # Deployment version is embedded explicitly above; skip Go's automatic
+        # VCS probe because this checkout can be nested under a parent repo or
+        # run without Git metadata on the deployment machine.
+        & go build -buildvcs=false -ldflags "-X main.version=$buildVersion" -o $binary ./capri-hub/cmd/capri-hub
         if ($LASTEXITCODE -ne 0) { throw "Go build failed with exit code $LASTEXITCODE" }
     }
     finally {
@@ -66,8 +69,9 @@ finally {
 }
 
 $sshArgs = @("-i", $SshKey, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new")
+$scpArgs = @("-O") + $sshArgs # Use legacy SCP mode for compatibility with this VPS SSH endpoint.
 Write-Host "Uploading binary to $Vps..."
-& scp @sshArgs $binary "${Vps}:$remoteStage"
+& scp @scpArgs $binary "${Vps}:$remoteStage"
 if ($LASTEXITCODE -ne 0) { throw "Upload failed with exit code $LASTEXITCODE" }
 
 $remoteScript = @"
