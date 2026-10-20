@@ -33,7 +33,16 @@ const (
 	// MaxHeaderValues bounds the number of header values in one set.
 	MaxHeaderValues = 200
 	// DefaultWindow is the initial per-lane credit window.
-	DefaultWindow = 256 << 10
+	//
+	// It is raised in units of MaxDecodedChunk: a sender parks in
+	// respFlow.wait once it has exhausted the window, and each park costs a
+	// full round trip (measured at ~1.2s on a congested WSS tunnel, vs a
+	// ~110ms baseline RTT). A 256KiB window forced a 606KB response through
+	// ~2.3 round trips of stop-and-wait, which measured 5.7s of flow-wait for
+	// a 6s request while an unrelated 195KB response finished in 203ms.
+	// 8MiB keeps every realistic response inside the first window, so the
+	// round-trip count stops scaling with response size.
+	DefaultWindow = 8 << 20
 	// MaxTunnelBodyBytes is the default request-body ceiling (configurable).
 	MaxTunnelBodyBytes = 64 << 20
 )

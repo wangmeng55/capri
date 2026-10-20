@@ -98,9 +98,21 @@ func (w *flowWindow) close() {
 // (limitOffset = ack + windowSize). Updates are coalesced by byte threshold or
 // time threshold so small writes do not flood the control plane (C3 §5).
 const (
-	ackByteThreshold = 64 << 10
+	// ackTimeThreshold bounds how long a receiver may stay silent before it
+	// emits an update anyway.
 	ackTimeThreshold = 20 * time.Millisecond
 )
+
+// ackWindowFraction is the share of the window a receiver may consume before
+// it must send an update, expressed as a divisor (1/4 of the window).
+//
+// The threshold must stay well below 1: the sender parks the moment it has sent
+// exactly one window's worth of unacknowledged bytes, so the update has to be
+// emitted early enough to arrive before that happens. A fixed 64KiB threshold
+// was correct for the old 256KiB window (1/4 of it) but became 1/64 of an 8MiB
+// window, which sends an update on every 64KiB of a much larger window and
+// floods the control plane.
+const ackWindowDivisor = 4
 
 type ackWindow struct {
 	window     int64
@@ -118,11 +130,22 @@ func newAckWindow(window int64) *ackWindow {
 
 // advance records that n bytes have been written downstream and reports whether
 // a window-update should be sent now, with the absolute limit offset to send.
+//
+// The byte threshold is proportional to the window (window/4) so the update is
+// emitted well before the sender exhausts its credit, and the sent position and
+// timestamp are recorded on every emitted update. Recording them matters: the
+// byte test compares against lastSent, so a stale lastSent makes
+// ack-lastSent stay above the threshold forever and every subsequent frame
+// emits its own window-update. That is what turned a 2512-frame response into
+// ~2512 control frames.
 func (a *ackWindow) advance(n int64) (limit int64, send bool) {
 	a.ack += n
 	limit = a.ack + a.window
+	byteThreshold := a.window / ackWindowDivisor
 	now := time.Now()
-	if a.ack-a.lastSent >= ackByteThreshold || now.Sub(a.lastSentAt) >= ackTimeThreshold {
+	if a.ack-a.lastSent >= byteThreshold || now.Sub(a.lastSentAt) >= ackTimeThreshold {
+		a.lastSent = a.ack
+		a.lastSentAt = now
 		return limit, true
 	}
 	return limit, false
