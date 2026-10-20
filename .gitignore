@@ -4,6 +4,9 @@
 !/tools/deploy-opencode-host.ps1
 /分析/
 
+# Local troubleshooting notes (never publish)
+/踩坑*.md
+
 # Local Go caches and workspaces
 **/.gocache/
 **/.gopath/
