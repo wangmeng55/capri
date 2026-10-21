@@ -2,13 +2,11 @@ param(
     [string]$InstallPath = (Join-Path (Split-Path -Parent $PSScriptRoot) "dist\opencode-host.exe")
 )
 
-# Transport selection:
-#   To force the newly launched Host to use WSS, set this in the same
-#   PowerShell session before running this script:
-#       $env:OCHOST_DISABLE_QUIC = "1"
-#   Start-Process inherits that process-scoped setting. It affects this Host
-#   launch only; remove the variable before a later deployment to restore the
-#   default QUIC-first behavior (with WSS fallback).
+# Transport defaults:
+#   WSS is used by default and tunnel writes are paced at 720,000 bytes/sec.
+#   To enable QUIC, set OCHOST_DISABLE_QUIC=0 before running this script.
+#   To disable pacing, set OCHOST_TUNNEL_BPS=0. Start-Process inherits these
+#   process-scoped settings; they affect this Host launch only.
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot

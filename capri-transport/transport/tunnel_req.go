@@ -289,6 +289,23 @@ func (hr *hostReq) abort() {
 	}
 }
 
+// Response coalescing. A handler typically reaches the tunnel through a
+// compressor: the host's local gateway wraps its response in a
+// gzip.BestSpeed writer, and flate's fast encoder emits ~246-byte blocks per
+// flush (compress/flate bufferFlushSize). Sending one frame per Write turned a
+// 619 KB gzipped response into 2,520 tunnel frames of 246 bytes. Coalescing
+// reduces those to MaxDecodedChunk-sized frames; the WSS codec sends their
+// payload as raw binary when both peers negotiate the binary subprotocol.
+const (
+	// respCoalesceBytes is the payload size that forces a batch out. It equals
+	// MaxDecodedChunk so a full batch is still exactly one legal frame.
+	respCoalesceBytes = MaxDecodedChunk
+	// respCoalesceDelay bounds how long a partial batch may sit. Without it a
+	// handler that emits a few bytes and never calls Flush (SSE, chunked JSON)
+	// would stall until the batch fills.
+	respCoalesceDelay = 10 * time.Millisecond
+)
+
 // hostResponseWriter streams a handler's response as response-start/data/end.
 type hostResponseWriter struct {
 	hr          *hostReq
@@ -299,11 +316,25 @@ type hostResponseWriter struct {
 	err         error
 	flowWait    time.Duration
 	tunnelWrite time.Duration
+
+	// mu guards buf, offset, err, and every frame emission below: Write and
+	// WriteHeader run on the handler goroutine while the coalesce timer runs on
+	// its own, so both can reach flush.
+	mu       sync.Mutex
+	buf      []byte
+	coalesce *time.Timer
+	done     bool
 }
 
 func (w *hostResponseWriter) Header() http.Header { return w.hdr }
 
 func (w *hostResponseWriter) WriteHeader(code int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.writeHeaderLocked(code)
+}
+
+func (w *hostResponseWriter) writeHeaderLocked(code int) {
 	if w.wroteHead {
 		return
 	}
@@ -319,58 +350,122 @@ func (w *hostResponseWriter) WriteHeader(code int) {
 	}
 }
 
+// Write appends the handler's output to the pending batch and emits a frame
+// only when the batch fills or the coalesce timer expires.
 func (w *hostResponseWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.err != nil {
 		return 0, w.err
 	}
 	if !w.wroteHead {
-		w.WriteHeader(http.StatusOK)
+		w.writeHeaderLocked(http.StatusOK)
 	}
 	if w.hr.head || noBodyStatus(w.status) {
 		return len(p), nil
 	}
+	if w.buf == nil {
+		w.buf = make([]byte, 0, respCoalesceBytes)
+	}
 	total := 0
 	for len(p) > 0 {
+		space := respCoalesceBytes - len(w.buf)
 		n := len(p)
-		if n > MaxDecodedChunk {
-			n = MaxDecodedChunk
+		if n > space {
+			n = space
 		}
-		chunk := p[:n]
+		w.buf = append(w.buf, p[:n]...)
 		p = p[n:]
-		end := w.offset + int64(n)
-		waitStarted := time.Now()
-		if err := w.hr.respFlow.wait(w.hr.ctx, end); err != nil {
-			w.flowWait += time.Since(waitStarted)
-			w.err = err
-			return total, err
-		}
-		w.flowWait += time.Since(waitStarted)
-		df := &Frame{ConnID: w.hr.connID, ReqID: w.hr.reqID, Op: OpResponseData, Lane: LaneResponse, Offset: w.offset}
-		df.setPayload(chunk)
-		sendStarted := time.Now()
-		if err := w.hr.send(df); err != nil {
-			w.tunnelWrite += time.Since(sendStarted)
-			w.err = err
-			return total, err
-		}
-		w.tunnelWrite += time.Since(sendStarted)
-		w.offset = end
 		total += n
+		if len(w.buf) >= respCoalesceBytes {
+			if err := w.flushLocked(); err != nil {
+				return total, err
+			}
+		}
 	}
+	w.armCoalesceLocked()
 	return total, nil
 }
 
-// Flush is a no-op: bytes are already sent incrementally per Write.
-func (w *hostResponseWriter) Flush() {}
+// flushLocked emits the pending batch as one response-data frame. setPayload
+// copies the batch, so the buffer can be reused right after send.
+func (w *hostResponseWriter) flushLocked() error {
+	if w.err != nil {
+		return w.err
+	}
+	if len(w.buf) == 0 {
+		return nil
+	}
+	w.stopCoalesceLocked()
+	end := w.offset + int64(len(w.buf))
+	waitStarted := time.Now()
+	err := w.hr.respFlow.wait(w.hr.ctx, end)
+	w.flowWait += time.Since(waitStarted)
+	if err != nil {
+		w.err = err
+		return err
+	}
+	df := &Frame{ConnID: w.hr.connID, ReqID: w.hr.reqID, Op: OpResponseData, Lane: LaneResponse, Offset: w.offset}
+	df.setPayload(w.buf)
+	sendStarted := time.Now()
+	err = w.hr.send(df)
+	w.tunnelWrite += time.Since(sendStarted)
+	if err != nil {
+		w.err = err
+		return err
+	}
+	w.offset = end
+	w.buf = w.buf[:0]
+	return nil
+}
+
+func (w *hostResponseWriter) armCoalesceLocked() {
+	if w.done || w.coalesce != nil || len(w.buf) == 0 {
+		return
+	}
+	w.coalesce = time.AfterFunc(respCoalesceDelay, w.flushOnTimer)
+}
+
+func (w *hostResponseWriter) stopCoalesceLocked() {
+	if w.coalesce != nil {
+		w.coalesce.Stop()
+		w.coalesce = nil
+	}
+}
+
+func (w *hostResponseWriter) flushOnTimer() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.coalesce = nil
+	if w.done {
+		return
+	}
+	_ = w.flushLocked()
+}
+
+// Flush sends whatever is buffered. Output is otherwise coalesced up to
+// respCoalesceBytes or respCoalesceDelay, whichever comes first.
+func (w *hostResponseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_ = w.flushLocked()
+}
 
 // finish emits response-end (normal EOF) with any trailers.
 func (w *hostResponseWriter) finish() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.done = true
+	w.stopCoalesceLocked()
 	if w.err != nil {
 		return
 	}
 	if !w.wroteHead {
-		w.WriteHeader(http.StatusOK)
+		w.writeHeaderLocked(http.StatusOK)
 	}
+	// The pending batch must reach the hub before response-end, otherwise the
+	// stream is silently truncated at the last emitted frame.
+	_ = w.flushLocked()
 	w.hr.traceDuration("flow_wait_total", w.status, w.offset, w.flowWait)
 	w.hr.traceDuration("tunnel_write_total", w.status, w.offset, w.tunnelWrite)
 	end := &Frame{ConnID: w.hr.connID, ReqID: w.hr.reqID, Op: OpResponseEnd, Offset: w.offset}

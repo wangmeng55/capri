@@ -60,13 +60,14 @@ func main() {
 	if hubURL := strings.TrimSpace(os.Getenv("OCHOST_HUB_URL")); hubURL != "" {
 		hostID := envOr("OCHOST_HOST_ID", "opencode-local")
 		go ochost.RunHubDataConnection(ctx, ochost.HubConfig{
-			URL:       hubURL,
-			HostID:    hostID,
-			HostToken: os.Getenv("OCHOST_HOST_TOKEN"),
-			Target:    proxy,
-			BodyLimit: 0,
-			QUICPort:  envInt("OCHOST_HUB_QUIC_PORT", 8788),
-			DisableQUIC: strings.TrimSpace(os.Getenv("OCHOST_DISABLE_QUIC")) == "1",
+			URL:         hubURL,
+			HostID:      hostID,
+			HostToken:   os.Getenv("OCHOST_HOST_TOKEN"),
+			Target:      proxy,
+			BodyLimit:   0,
+			QUICPort:    envInt("OCHOST_HUB_QUIC_PORT", 8788),
+			DisableQUIC: strings.TrimSpace(envOr("OCHOST_DISABLE_QUIC", "1")) == "1",
+			TunnelBPS:   int64(envInt("OCHOST_TUNNEL_BPS", 720000)),
 		})
 		log.Printf("[opencode-host] connecting to hub %s as host %q", hubURL, hostID)
 	}

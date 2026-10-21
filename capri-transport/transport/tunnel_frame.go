@@ -21,12 +21,17 @@ const TunnelVersion = 1
 // FrameTypeTunnel is the envelope `type` for every transparent frame.
 const FrameTypeTunnel = "tunnel"
 
+// WSTunnelBinaryDataSubprotocol enables raw binary WSS messages for tunnel
+// body frames. If it isn't negotiated, WSFrameConn keeps the legacy JSON/base64
+// wire format so mixed-version deployments continue to work.
+const WSTunnelBinaryDataSubprotocol = "capri-tunnel-binary-v1"
+
 // Protocol limits (contract C3/C4 defaults). These are starting values, not
 // measured SLAs.
 const (
 	// MaxDecodedChunk is the largest decoded data payload carried by one frame.
 	MaxDecodedChunk = 64 << 10
-	// MaxWireFrame is the largest encoded JSON frame accepted on the wire.
+	// MaxWireFrame is the largest encoded JSON or WSS binary message accepted.
 	MaxWireFrame = 256 << 10
 	// MaxHeaderBytes bounds the decoded size of one HTTP header set.
 	MaxHeaderBytes = 64 << 10
@@ -133,6 +138,7 @@ type Frame struct {
 	Lane       string `json:"lane,omitempty"`
 	Offset     int64  `json:"offset,omitempty"`
 	PayloadB64 string `json:"payloadB64,omitempty"`
+	payloadRaw []byte
 
 	// http-open / ws-open
 	Method         string           `json:"method,omitempty"`
@@ -161,27 +167,46 @@ type Frame struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// Data decodes PayloadB64 (exported for hosts and tests that receive frames).
+// Data returns the payload bytes for hosts and tests that receive frames.
 func (f *Frame) Data() ([]byte, error) { return f.payload() }
 
-// SetData base64-encodes b into PayloadB64 (exported for hosts emitting frames).
+// DataLen returns the decoded payload length without allocating a decoded copy.
+func (f *Frame) DataLen() int {
+	if f.payloadRaw != nil {
+		return len(f.payloadRaw)
+	}
+	if f.PayloadB64 == "" {
+		return 0
+	}
+	n := base64.StdEncoding.DecodedLen(len(f.PayloadB64))
+	if strings.HasSuffix(f.PayloadB64, "==") {
+		n -= 2
+	} else if strings.HasSuffix(f.PayloadB64, "=") {
+		n--
+	}
+	return n
+}
+
+// SetData stores b as the frame payload. WSS sends it as raw binary; transports
+// that still use the JSON frame codec encode it only when serializing.
 func (f *Frame) SetData(b []byte) { f.setPayload(b) }
 
-// payload decodes PayloadB64.
+// payload returns raw bytes when present, otherwise decodes the legacy JSON
+// representation. The latter is retained for QUIC and mixed-version WSS.
 func (f *Frame) payload() ([]byte, error) {
+	if f.payloadRaw != nil {
+		return f.payloadRaw, nil
+	}
 	if f.PayloadB64 == "" {
 		return nil, nil
 	}
 	return base64.StdEncoding.DecodeString(f.PayloadB64)
 }
 
-// setPayload base64-encodes b into PayloadB64.
+// setPayload takes a copy so callers may immediately reuse their input buffer.
 func (f *Frame) setPayload(b []byte) {
-	if len(b) == 0 {
-		f.PayloadB64 = ""
-		return
-	}
-	f.PayloadB64 = base64.StdEncoding.EncodeToString(b)
+	f.PayloadB64 = ""
+	f.payloadRaw = append(f.payloadRaw[:0], b...)
 }
 
 // EncodeFrame marshals f and enforces the wire-frame ceiling.
@@ -195,7 +220,11 @@ func EncodeFrame(f *Frame) ([]byte, error) {
 	if f.TunnelVersion == 0 {
 		f.TunnelVersion = TunnelVersion
 	}
-	b, err := json.Marshal(f)
+	wire := *f
+	if wire.payloadRaw != nil {
+		wire.PayloadB64 = base64.StdEncoding.EncodeToString(wire.payloadRaw)
+	}
+	b, err := json.Marshal(&wire)
 	if err != nil {
 		return nil, err
 	}

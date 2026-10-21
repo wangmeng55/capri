@@ -9,7 +9,7 @@ hub 认证 hostId 后生成透明数据会话 connId；所有隧道帧都绑定�
 | 底层传输 | 新透明通道的承载 |
 |---|---|
 | QUIC | 双方显式协商后，由 hub 为每条透明请求开启独立双向 QUIC stream，首帧是 http-open/ws-open；响应在同一 stream 回传。连接控制流继续承载鉴权、心跳和优先取消。 |
-| WS 数据连接 | host 主动连接 WSS `/ws/host/tunnel`；同一连接按 reqId 复用透明请求。 |
+| WS 数据连接 | host 主动连接 WSS `/ws/host/tunnel`；同一连接按 reqId 复用透明请求。通过 `capri-tunnel-binary-v1` 子协议启用二进制数据帧；未协商时回退到旧 JSON 格式。 |
 
 WS 数据连接通过控制会话中取得的一次性 tunnelTicket 建立，ticket 绑定已认证 hostId 与控制会话，默认 30 秒过期；原子消费后生成 connId 并回复 tunnel-ready。host 是原生程序，可使用 Authorization 头提交 ticket。控制会话消失时关闭附属数据连接。数据连接断开后可在仍有效控制会话上请求新 ticket，但必须生成新 connId 并失败结束旧隧道，不续传旧字节。
 
@@ -31,7 +31,7 @@ QUIC 透明独立 stream 和 WS 新数据连接是协议扩展，hub 与共享�
 
 ## 2. 帧编码与公共字段
 
-首版使用 JSON envelope，二进制 body/升级字节用 base64。QUIC 用 4 字节大端长度前缀包裹 JSON；WS 数据连接每个 text message 承载一帧 JSON。浏览器内层 WS 的压缩字节可以原样经过隧道。
+控制帧使用 JSON envelope。QUIC 保持现有 4 字节大端长度前缀包裹 JSON，数据载荷仍为 base64。WSS 数据连接协商 `capri-tunnel-binary-v1` 后，控制帧仍为 JSON text message；request-data、response-data、ws-data 使用 binary message，格式为 4 字节大端 JSON header 长度 + 不含 payloadB64 的 JSON header + 原始载荷。没有协商该子协议时，WSS 双方回退到旧 JSON/base64 数据帧，以支持滚动升级。浏览器内层 WS 的压缩字节可以原样经过隧道。
 
 ```json
 {
@@ -47,21 +47,21 @@ QUIC 透明独立 stream 和 WS 新数据连接是协议扩展，hub 与共享�
 }
 ```
 
-这是协议载荷示例，不是实现代码。reqId 至少 128 bit 随机，当前 connId 内唯一。帧的主机归属由认证连接确定；不能按未校验的 payload.hostId 改换目标。`offset` 为该 lane 已发送的原始字节数，从 0 起连续递增；按解码后字节计数，不按 base64 字符长度。
+这是 legacy WSS/QUIC 数据帧示例，不是实现代码。reqId 至少 128 bit 随机，当前 connId 内唯一。帧的主机归属由认证连接确定；不能按未校验的 payload.hostId 改换目标。`offset` 为该 lane 已发送的原始字节数，从 0 起连续递增；按原始载荷字节计数。
 
 JSON header 表示为多值条目列表，例如 `[{"name":"Set-Cookie","values":["a=1","b=2"]}]`，保留重复值与值的顺序。字段名须是 HTTP token，值拒绝 CR/LF/NUL，编码器必须保留合法 header octets，不得用有损 Unicode 替换；遇到不能用 JSON 文本无损表示的原始值，使用同条目的 `valuesB64` 字节表示，values 与 valuesB64 互斥。Cookie/Authorization 不写普通日志。
 
-默认 decoded 数据块 ≤64 KiB；单个 JSON wire frame ≤256 KiB；单组 HTTP 头解码后 ≤64 KiB 且 ≤200 个字段值。超限、无效 base64、跳跃 offset、重复终帧等按 C4 处理。
+默认原始数据块 ≤64 KiB；单个 wire message ≤256 KiB；单组 HTTP 头解码后 ≤64 KiB 且 ≤200 个字段值。QUIC/legacy JSON 帧的 payloadB64 必须有效；二进制 WSS 帧必须包含合法数据操作和长度前缀。超限、跳跃 offset、重复终帧等按 C4 处理。
 
 ## 3. HTTP 帧与方向
 
 | op | 发送方向 | 字段/效果 |
 |---|---|---|
 | http-open | hub→host | method、target（path+raw query）、headers、可信 publicOrigin、initialWindows；创建请求，不含整块 body |
-| request-data | hub→host | lane=request、offset、payloadB64；分块上传 |
+| request-data | hub→host | lane=request、offset、原始载荷；WSS binary frame，旧 WSS/QUIC 用 payloadB64；分块上传 |
 | request-end | hub→host | 最终 offset、trailers；请求体 EOF，即使没有 body 也发送 |
 | response-start | host→hub | 最终 status（非 101）、headers、声明 trailer 名称；只发送一次 |
-| response-data | host→hub | lane=response、offset、payloadB64；所有响应均可分块，不依赖 Accept 识别 |
+| response-data | host→hub | lane=response、offset、原始载荷；WSS binary frame，旧 WSS/QUIC 用 payloadB64；所有响应均可分块，不依赖 Accept 识别 |
 | response-end | host→hub | 最终 offset、trailers；正常 EOF，释放 HTTP 请求 |
 | request-stop | host→hub | 原因 early_response；停止未完成上传，允许响应继续到 response-end |
 | window-update | 收到数据的一方→发送方 | lane、ackOffset、limitOffset；增加指定方向可用窗口 |
@@ -95,7 +95,7 @@ HEAD 和不允许 body 的状态遵循 HTTP 语义，response-data 必须为空�
 | ws-open | hub→host | target、headers（包括 Upgrade/Connection/Key/Version/Protocol/Extensions）、publicOrigin、ws-up/ws-down initialWindows |
 | ws-ready | host→hub | status=101、上游握手 headers；后端协议升级成功，但 hub 尚需完整写回浏览器 101 |
 | response-start/data/end | host→hub | 上游拒绝升级时返回实际 HTTP 状态/头/体，不能把所有 4xx 一律改成 502 |
-| ws-data | 任一方→另一方 | lane=ws-up/ws-down、offset、payloadB64；仅在 ws-ready 后允许 |
+| ws-data | 任一方→另一方 | lane=ws-up/ws-down、offset、原始载荷；WSS binary frame，旧 WSS/QUIC 用 payloadB64；仅在 ws-ready 后允许 |
 | ws-end | 任一方→另一方 | 本方向 TCP EOF、最终 offset；不代表一个 WS closeCode |
 | window-update / cancel / stream-error | 同 HTTP | 单方向窗口 / 整隧道失败清理 |
 

@@ -36,6 +36,10 @@ type HubConfig struct {
 	QUICPort int
 	// DisableQUIC forces the Hub data connection to use WSS.
 	DisableQUIC bool
+	// TunnelBPS caps how fast this host pushes bytes into the data connection
+	// (0 = unlimited). Bursts are what overflow the queue in front of a home
+	// uplink and cost a full retransmission timeout each; see pace.go.
+	TunnelBPS int64
 }
 
 // RunHubDataConnection keeps a transparent data connection to the hub. It
@@ -45,9 +49,18 @@ type HubConfig struct {
 func RunHubDataConnection(ctx context.Context, cfg HubConfig) {
 	backoff := time.Second
 	for ctx.Err() == nil {
+		started := time.Now()
 		err := runHubOnce(ctx, cfg)
 		if ctx.Err() != nil {
 			return
+		}
+		// Restart the ladder after a session that actually stayed up: its
+		// failure is a new event, not a continuation of the same outage.
+		// Without this the backoff only ever doubles for the life of the
+		// process, so a reconnect after a long healthy session still waits up
+		// to 30 s and every request in that window has nowhere to go.
+		if time.Since(started) >= tunnelHealthyAfter {
+			backoff = time.Second
 		}
 		if err != nil {
 			log.Printf("[opencode-host] hub tunnel down: %v (retry in %s)", err, backoff)
@@ -62,6 +75,18 @@ func RunHubDataConnection(ctx context.Context, cfg HubConfig) {
 		}
 	}
 }
+
+const (
+	// tunnelHealthyAfter is the uptime that counts as a working session rather
+	// than a failed dial, and therefore resets the reconnect backoff.
+	tunnelHealthyAfter = 30 * time.Second
+	// wsKeepAliveInterval/Timeout drive the data-connection WebSocket ping.
+	// The tunnel is silent while idle (no requests in flight), which is exactly
+	// when NAT/proxy idle timers fire: a home connection dropped every 60 s
+	// until the host started pinging. 20 s keeps the path warm with margin.
+	wsKeepAliveInterval = 20 * time.Second
+	wsKeepAliveTimeout  = 10 * time.Second
+)
 
 func runHubOnce(ctx context.Context, cfg HubConfig) error {
 	if cfg.DisableQUIC {
@@ -86,19 +111,57 @@ func runHubWSOnce(ctx context.Context, cfg HubConfig) error {
 	}
 	wsURL := toWSURL(cfg.URL) + "/ws/host/tunnel"
 	c, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + ticket}},
+		HTTPHeader:   http.Header{"Authorization": {"Bearer " + ticket}},
+		Subprotocols: []string{transport.WSTunnelBinaryDataSubprotocol},
 	})
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", wsURL, err)
 	}
-	// Tunnel data frames carry up to MaxDecodedChunk bytes as base64 JSON,
-	// which is larger than coder/websocket's 32 KiB default read limit.
-	// Keep the WebSocket limit aligned with the tunnel codec on both ends.
+	// Keep the read limit aligned with the largest tunnel message. New peers
+	// carry data as raw binary; older peers fall back to JSON/Base64 frames.
 	c.SetReadLimit(transport.MaxWireFrame)
 	log.Printf("[opencode-host] data connection established to %s", wsURL)
 
-	agent := transport.NewTunnelHostAgent("ws-"+cfg.HostID, transport.NewWSFrameConn(c), cfg.Target, cfg.BodyLimit)
+	fc := transport.NewWSFrameConn(c)
+	stopKeepAlive := startWSKeepAlive(ctx, fc)
+	defer stopKeepAlive()
+
+	var tunnel transport.FrameConn = fc
+	if cfg.TunnelBPS > 0 {
+		log.Printf("[opencode-host] pacing tunnel writes at %d KiB/s", cfg.TunnelBPS/1024)
+		tunnel = newPacedConn(tunnel, cfg.TunnelBPS)
+	} else {
+		log.Printf("[opencode-host] tunnel write pacing disabled (unlimited)")
+	}
+
+	agent := transport.NewTunnelHostAgent("ws-"+cfg.HostID, tunnel, cfg.Target, cfg.BodyLimit)
 	return agent.Run(ctx)
+}
+
+// startWSKeepAlive pings the hub's data connection while it is idle so NAT
+// gateways and proxies do not expire the flow. The returned func stops it.
+func startWSKeepAlive(ctx context.Context, fc *transport.WSFrameConn) func() {
+	pingCtx, stop := context.WithCancel(ctx)
+	go func() {
+		t := time.NewTicker(wsKeepAliveInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-t.C:
+			}
+			pctx, cancel := context.WithTimeout(pingCtx, wsKeepAliveTimeout)
+			err := fc.Ping(pctx)
+			cancel()
+			if err != nil {
+				// The read side observes the same failure and reconnects;
+				// stop pinging rather than hammering a dead connection.
+				return
+			}
+		}
+	}()
+	return stop
 }
 
 func runHubQUICOnce(ctx context.Context, cfg HubConfig) error {
